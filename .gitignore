@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+*.log
+.janome_jp4_process.pid
+.janome_jp4_process.mode
+.janome_jp4_desired_state.json
+last_monitor_session.json

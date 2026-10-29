@@ -1,0 +1,28 @@
+{
+  "startup": {
+    "auto_start_on_startup": false,
+    "auto_start_mode": "real"
+  },
+  "AUTO_START_ON_STARTUP": false,
+  "AUTO_START_MODE": "real",
+  "serial": {
+    "port": "COM3",
+    "baudrate": 38400,
+    "timeout": 2
+  },
+  "database": {
+    "db_type": "sqlite",
+    "db_name": "janome_jp4_data.db",
+    "table_name": "janome_jp4_telemetry",
+    "host": "localhost",
+    "port": 5432,
+    "user": "admin",
+    "password": "admin",
+    "sqlite_path": "janome_jp4_data.db",
+    "description": "Database storage for JANOME Electro Press JP4 telemetry data"
+  },
+  "acquisition": {
+    "interval_time": 1,
+    "max_retries": 3
+  }
+}
