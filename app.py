@@ -70,8 +70,7 @@ def read_config():
             "description": "Database storage for JANOME Electro Press JP4 telemetry data"
         },
         "acquisition": {
-            "interval_time": 1,
-            "max_retries": 3
+            "interval_time": 1
         }
     }
     try:

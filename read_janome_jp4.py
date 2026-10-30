@@ -274,14 +274,13 @@ def load_config(config_path="config.json"):
             "timeout": 2.0
         },
         "database": {
-            "db_type": "sqlite",
+            "db_type": "none",
             "db_name": "janome_jp4_data.db",
             "table_name": "janome_jp4_telemetry",
             "description": "Database storage for JANOME Electro Press JP4 telemetry data"
         },
         "acquisition": {
-            "interval_time": 1.0,
-            "max_retries": 3
+            "interval_time": 1.0
         }
     }
 
@@ -317,7 +316,10 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
         print("  Database:      NONE (log only - samples are not stored)")
     else:
         print(f"  DB Type:       {db_type}")
-        print(f"  DB Name:       {db_cfg.get('db_name', 'janome_jp4_data.db')}")
+        if db_type == "sqlite":
+            print(f"  DB File:       {db_cfg.get('sqlite_path') or db_cfg.get('db_name', 'janome_jp4_data.db')}")
+        else:
+            print(f"  DB Name:       {db_cfg.get('db_name', 'janome_jp4_data.db')}")
         print(f"  Table Name:    {db_cfg.get('table_name', 'janome_jp4_telemetry')}")
     print("=" * 65)
 

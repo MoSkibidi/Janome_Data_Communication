@@ -141,8 +141,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 description: "Database storage for JANOME Electro Press JP4 telemetry data"
             },
             acquisition: {
-                interval_time: parseFloat(acqInterval.value),
-                max_retries: 3
+                interval_time: parseFloat(acqInterval.value)
             }
         };
 

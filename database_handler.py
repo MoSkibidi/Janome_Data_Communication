@@ -34,8 +34,10 @@ class DatabaseHandler:
     def connect(self):
         """Establishes connection to the configured database. Auto-creates DB if missing."""
         if self.db_type == "sqlite":
-            self.conn = sqlite3.connect(self.db_name, check_same_thread=False)
-            logger.info(f"Connected to SQLite database: {self.db_name}")
+            # sqlite_path is what the panel's "SQLite file path" field saves; db_name is the PostgreSQL database name
+            sqlite_file = self.config.get("sqlite_path") or self.db_name
+            self.conn = sqlite3.connect(sqlite_file, check_same_thread=False)
+            logger.info(f"Connected to SQLite database: {sqlite_file}")
         elif self.db_type in ("postgres", "postgresql", "timescaledb"):
             try:
                 import psycopg2
