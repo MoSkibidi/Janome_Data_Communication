@@ -14,6 +14,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const elEncoder = document.getElementById('telemetry-encoder');
     const elTeaching = document.getElementById('telemetry-teaching');
     const elLoad = document.getElementById('telemetry-load');
+    const elDb = document.getElementById('telemetry-db');
 
     // DOM Elements - Form Fields
     const configForm = document.getElementById('config-form');
@@ -285,11 +286,26 @@ document.addEventListener('DOMContentLoaded', () => {
         terminalBody.innerHTML = '';
     });
 
+    // Database readout under the live readings
+    function showDbState(state, pending) {
+        const waiting = parseInt(pending, 10) || 0;
+        if (state === 'down') {
+            elDb.textContent = `Unreachable - ${waiting} waiting on disk`;
+            elDb.className = 'db-state db-down';
+        } else if (state === 'connected') {
+            elDb.textContent = waiting > 1 ? `Connected - sending ${waiting}` : 'Connected';
+            elDb.className = 'db-state db-ok';
+        } else {
+            elDb.textContent = 'Not used';
+            elDb.className = 'db-state db-none';
+        }
+    }
+
     // Log Console Helper
     function appendLog(lineText, type = 'sys') {
         const div = document.createElement('div');
         div.className = 'log-line';
-        if (type === 'err' || lineText.includes('ERROR') || lineText.includes('failed')) {
+        if (type === 'err' || lineText.includes('ERROR') || lineText.includes('WARNING') || lineText.includes('failed')) {
             div.classList.add('err-line');
         } else if (type === 'stats' || lineText.includes('[STATS]') || lineText.includes('Success')) {
             div.classList.add('stats-line');
@@ -313,17 +329,17 @@ document.addEventListener('DOMContentLoaded', () => {
         if (isRunning) {
             if (mode === 'real') {
                 statusDot.className = 'pulse-dot online';
-                statusText.textContent = 'HARDWARE ACTIVE';
+                statusText.textContent = 'Running (reading the press)';
             } else {
                 statusDot.className = 'pulse-dot mock';
-                statusText.textContent = 'MOCK SIMULATION';
+                statusText.textContent = 'Running (simulation)';
             }
             btnStartReal.disabled = true;
             btnStartMock.disabled = true;
             btnStop.disabled = false;
         } else {
             statusDot.className = 'pulse-dot offline';
-            statusText.textContent = 'OFFLINE';
+            statusText.textContent = 'Stopped';
             btnStartReal.disabled = false;
             btnStartMock.disabled = false;
             btnStop.disabled = true;
@@ -336,6 +352,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (stats.encoder_position_mm) elEncoder.textContent = stats.encoder_position_mm;
         if (stats.teaching_position_mm) elTeaching.textContent = stats.teaching_position_mm;
         if (stats.load_n) elLoad.textContent = stats.load_n;
+        if (stats.db_state) showDbState(stats.db_state, stats.db_pending);
     });
 
     socket.on('log_update', (data) => {

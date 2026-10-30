@@ -3,296 +3,207 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>JANOME JP4 Electro Press Control Panel</title>
-    <!-- Outfit Font & Monospace -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <title>Janome JP4 Control Panel</title>
     <link rel="stylesheet" href="/static/style.css">
     <!-- Socket.IO Client Library -->
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head>
 <body>
-    <div class="dashboard-container">
-        <!-- Header -->
-        <header class="main-header">
-            <div class="brand">
-                <div class="brand-text">
-                    <h1>JANOME JP4 CONTROL PANEL</h1>
-                    <span class="sub-text">ELECTRO PRESS TELEMETRY INGESTION SUITE</span>
-                </div>
+    <header class="topbar">
+        <div class="topbar-inner">
+            <div class="title-group">
+                <h1>Janome JP4 Electro Press</h1>
+                <p>Telemetry panel</p>
             </div>
-            <div class="header-status">
-                <div class="status-indicator" id="system-status-indicator">
+            <div class="topbar-right">
+                <div class="status-pill" id="system-status-indicator">
                     <span class="pulse-dot offline" id="status-dot"></span>
-                    <span class="status-label" id="status-text">OFFLINE</span>
+                    <span id="status-text">Stopped</span>
                 </div>
-                <div class="clock-display" id="realtime-clock">--:--:--</div>
+                <time class="clock" id="realtime-clock">--:--:--</time>
             </div>
-        </header>
+        </div>
+    </header>
 
-        <!-- Protocol Notice Banner -->
-        <div class="notice-banner">
-            <strong>Protocol notice:</strong> Janome does not publish an RS-232 command protocol for JP4.
-            This driver uses the documented JP5 (JPF) COM protocol as a best-effort substitute and is
-            <strong>unverified against real JP4 firmware</strong>. Run mode is read-only telemetry
-            (position &amp; load) &mdash; no run/motion commands are issued. Verify against your machine
-            in a safe state before relying on this data.
+    <main class="layout">
+        <div class="main-col">
+            <!-- Live readings -->
+            <section class="card" aria-labelledby="readings-title">
+                <h2 id="readings-title">Live readings</h2>
+                <div class="readings">
+                    <div class="reading">
+                        <span class="reading-label">Actual position</span>
+                        <span class="reading-value"><span id="telemetry-encoder">0.0000</span><span class="reading-unit">mm</span></span>
+                    </div>
+                    <div class="reading">
+                        <span class="reading-label">Programmed position</span>
+                        <span class="reading-value"><span id="telemetry-teaching">0.0000</span><span class="reading-unit">mm</span></span>
+                    </div>
+                    <div class="reading">
+                        <span class="reading-label">Load</span>
+                        <span class="reading-value"><span id="telemetry-load">0.0</span><span class="reading-unit">N</span></span>
+                    </div>
+                </div>
+                <dl class="facts">
+                    <div class="fact">
+                        <dt>Readings taken</dt>
+                        <dd id="telemetry-polled">0</dd>
+                    </div>
+                    <div class="fact">
+                        <dt>Database</dt>
+                        <dd id="telemetry-db" class="db-state db-none">Not used</dd>
+                    </div>
+                </dl>
+            </section>
+
+            <!-- Start / stop -->
+            <section class="card" aria-labelledby="control-title">
+                <h2 id="control-title">Control</h2>
+                <div class="control-row">
+                    <button type="button" id="btn-start-real" class="btn btn-primary">
+                        <span class="btn-title">Start</span>
+                        <span class="btn-sub">Read from the press</span>
+                    </button>
+                    <button type="button" id="btn-start-mock" class="btn btn-secondary">
+                        <span class="btn-title">Start simulation</span>
+                        <span class="btn-sub">Test data, no press needed</span>
+                    </button>
+                    <button type="button" id="btn-stop" class="btn btn-danger" disabled>
+                        <span class="btn-title">Stop</span>
+                        <span class="btn-sub">End the current run</span>
+                    </button>
+                </div>
+                <p class="note">This panel only reads position and load. It never sends motion commands to the press.</p>
+            </section>
+
+            <!-- Log -->
+            <section class="card log-card" aria-labelledby="log-title">
+                <div class="log-header">
+                    <h2 id="log-title">Log</h2>
+                    <button type="button" id="btn-clear-log" class="btn-link" title="Clear the log view">Clear</button>
+                </div>
+                <div class="log-body" id="terminal-body" role="log" aria-live="polite">
+                    <div class="log-line sys-line">Starting Janome JP4 panel...</div>
+                </div>
+            </section>
         </div>
 
-        <!-- Live Telemetry Display Section -->
-        <section class="live-telemetry">
-            <div class="telemetry-grid">
-                <div class="telemetry-card">
-                    <span class="telemetry-label">Ingested Telemetry Cycles</span>
-                    <span class="telemetry-value monospace text-cyan" id="telemetry-polled">0</span>
-                </div>
-                <div class="telemetry-card">
-                    <span class="telemetry-label">Encoder Position (Actual Ram)</span>
-                    <div class="telemetry-val-group">
-                        <span class="telemetry-value monospace" id="telemetry-encoder">0.0000</span>
-                        <span class="telemetry-unit">mm</span>
-                    </div>
-                </div>
-                <div class="telemetry-card">
-                    <span class="telemetry-label">Teaching Position (Programmed)</span>
-                    <div class="telemetry-val-group">
-                        <span class="telemetry-value monospace" id="telemetry-teaching">0.0000</span>
-                        <span class="telemetry-unit">mm</span>
-                    </div>
-                </div>
-                <div class="telemetry-card">
-                    <span class="telemetry-label">Current Load</span>
-                    <div class="telemetry-val-group">
-                        <span class="telemetry-value monospace text-amber" id="telemetry-load">0.0</span>
-                        <span class="telemetry-unit">N</span>
-                    </div>
-                </div>
-            </div>
-        </section>
+        <aside class="side-col">
+            <form id="config-form" class="card settings" aria-labelledby="settings-title">
+                <h2 id="settings-title">Settings</h2>
 
-        <!-- Main Layout: Config Panel & Process Control Console -->
-        <div class="main-layout">
-            <!-- Left Panel: Configuration Editor -->
-            <section class="config-panel">
-                <div class="panel-header">
-                    <h2>SYSTEM CONFIGURATION</h2>
-                    <span class="panel-subtitle">Edit config.json parameters</span>
-                </div>
-                <form id="config-form" class="config-form">
-                    <!-- Startup & Automation Settings -->
-                    <div class="section-divider-title">STARTUP & AUTOMATION</div>
-                    <div class="form-row">
-                        <div class="form-group flex-2 checkbox-group">
-                            <input type="checkbox" id="AUTO_START_ON_STARTUP" name="AUTO_START_ON_STARTUP" class="custom-checkbox">
-                            <label for="AUTO_START_ON_STARTUP">Auto-start Ingestion Process on Application Startup</label>
-                        </div>
-                        <div class="form-group flex-1">
-                            <label for="AUTO_START_MODE">Startup Execution Mode</label>
-                            <select id="AUTO_START_MODE" name="AUTO_START_MODE" class="custom-select">
-                                <option value="mockup">Mockup Mode (Simulation)</option>
-                                <option value="real">Real Hardware (Serial Port)</option>
-                            </select>
-                        </div>
-                    </div>
-
-                    <!-- Serial Communication Section -->
-                    <div class="section-divider-title">RS-232 HARDWARE & SERIAL PORT</div>
-                    <div class="form-row">
-                        <div class="form-group flex-2">
-                            <label for="SERIAL_PORT">Serial Port Interface</label>
+                <details class="section" open>
+                    <summary>Serial connection</summary>
+                    <div class="section-body">
+                        <div class="field">
+                            <label for="SERIAL_PORT">Serial port</label>
                             <div class="scan-input-group">
-                                <input type="text" id="SERIAL_PORT" name="SERIAL_PORT" required placeholder="e.g. COM3 or /dev/cu.usbserial-jp4">
-                                <button type="button" id="btn-scan-serial" class="btn-scan-usb" title="Scan Host PC for Serial & COM Ports">
-                                    <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round" class="scan-icon">
-                                        <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
-                                    </svg>
-                                    <span>SCAN PORTS</span>
-                                </button>
+                                <input type="text" id="SERIAL_PORT" name="SERIAL_PORT" required placeholder="COM3 or /dev/ttyUSB0">
+                                <button type="button" id="btn-scan-serial" class="btn btn-secondary btn-small" title="Look for serial ports on this computer">Find ports</button>
+                                <div id="scanned-ports-menu" class="scanned-devices-menu hidden"></div>
                             </div>
-                            <div id="scanned-ports-menu" class="scanned-devices-menu hidden"></div>
                         </div>
-                        <div class="form-group flex-1">
-                            <label for="SERIAL_BAUDRATE">Baud Rate</label>
-                            <select id="SERIAL_BAUDRATE" name="SERIAL_BAUDRATE" class="custom-select">
-                                <option value="9600">9600 bps (Standard)</option>
-                                <option value="19200">19200 bps</option>
-                                <option value="38400">38400 bps</option>
-                                <option value="57600">57600 bps</option>
-                                <option value="115200">115200 bps</option>
+                        <div class="field">
+                            <label for="SERIAL_BAUDRATE">Baud rate</label>
+                            <select id="SERIAL_BAUDRATE" name="SERIAL_BAUDRATE">
+                                <option value="9600">9600</option>
+                                <option value="19200">19200</option>
+                                <option value="38400">38400</option>
+                                <option value="57600">57600</option>
+                                <option value="115200">115200</option>
                             </select>
                         </div>
-                    </div>
-
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="SERIAL_TIMEOUT">Timeout (Seconds)</label>
-                            <input type="number" id="SERIAL_TIMEOUT" name="SERIAL_TIMEOUT" step="0.1" min="0.1" required value="2.0">
-                        </div>
-                        <div class="form-group">
-                            <label for="ACQ_INTERVAL">Interval Time (Sec)</label>
-                            <input type="number" id="ACQ_INTERVAL" name="ACQ_INTERVAL" step="0.1" min="0.1" required value="1.0">
-                        </div>
-                    </div>
-
-                    <div class="test-btn-row">
-                        <button type="button" id="btn-test-serial" class="btn-secondary">
-                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
-                                <polyline points="22 4 12 14.01 9 11.01"></polyline>
-                            </svg>
-                            <span>TEST SERIAL PORT</span>
-                        </button>
-                    </div>
-
-                    <!-- Database Target Settings -->
-                    <div class="section-divider-title">DATABASE TARGET CONFIGURATION</div>
-                    <div class="form-group">
-                        <label for="DB_TYPE">Database Engine Target</label>
-                        <select id="DB_TYPE" name="DB_TYPE" class="custom-select">
-                            <option value="none">None (log only - nothing is stored)</option>
-                            <option value="sqlite">SQLite (Local Embedded File)</option>
-                            <option value="postgresql">PostgreSQL / TimescaleDB (Relational / Time-Series)</option>
-                        </select>
-                    </div>
-
-                    <!-- PostgreSQL Split Configuration Group -->
-                    <div id="postgres-config-group" class="db-group" style="display: none;">
-                        <div class="form-row">
-                            <div class="form-group flex-2">
-                                <label for="DB_HOST">Host Address</label>
-                                <input type="text" id="DB_HOST" name="DB_HOST" placeholder="localhost">
+                        <div class="field-row">
+                            <div class="field">
+                                <label for="SERIAL_TIMEOUT">Timeout (s)</label>
+                                <input type="number" id="SERIAL_TIMEOUT" name="SERIAL_TIMEOUT" step="0.1" min="0.1" required value="2.0">
                             </div>
-                            <div class="form-group flex-1">
-                                <label for="DB_PORT">Port</label>
-                                <input type="number" id="DB_PORT" name="DB_PORT" placeholder="5432">
+                            <div class="field">
+                                <label for="ACQ_INTERVAL">Read every (s)</label>
+                                <input type="number" id="ACQ_INTERVAL" name="ACQ_INTERVAL" step="0.1" min="0.1" required value="1.0">
                             </div>
                         </div>
-                        <div class="form-row">
-                            <div class="form-group flex-1">
-                                <label for="DB_NAME">Database Name</label>
+                        <button type="button" id="btn-test-serial" class="btn btn-secondary btn-small">Test serial port</button>
+                    </div>
+                </details>
+
+                <details class="section" open>
+                    <summary>Database</summary>
+                    <div class="section-body">
+                        <div class="field">
+                            <label for="DB_TYPE">Store readings in</label>
+                            <select id="DB_TYPE" name="DB_TYPE">
+                                <option value="none">Nowhere (show in log only)</option>
+                                <option value="sqlite">SQLite file</option>
+                                <option value="postgresql">PostgreSQL / TimescaleDB</option>
+                            </select>
+                        </div>
+
+                        <div id="postgres-config-group" class="db-group" style="display: none;">
+                            <div class="field-row field-row-wide">
+                                <div class="field">
+                                    <label for="DB_HOST">Host</label>
+                                    <input type="text" id="DB_HOST" name="DB_HOST" placeholder="localhost">
+                                </div>
+                                <div class="field field-narrow">
+                                    <label for="DB_PORT">Port</label>
+                                    <input type="number" id="DB_PORT" name="DB_PORT" placeholder="5432">
+                                </div>
+                            </div>
+                            <div class="field">
+                                <label for="DB_NAME">Database</label>
                                 <input type="text" id="DB_NAME" name="DB_NAME" placeholder="janome_jp4_data">
                             </div>
-                            <div class="form-group flex-1">
-                                <label for="DB_TABLE">Table Name</label>
+                            <div class="field">
+                                <label for="DB_TABLE">Table</label>
                                 <input type="text" id="DB_TABLE" name="DB_TABLE" placeholder="janome_jp4_telemetry">
                             </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group flex-1">
-                                <label for="DB_USER">Username</label>
-                                <input type="text" id="DB_USER" name="DB_USER" placeholder="admin">
+                            <div class="field-row">
+                                <div class="field">
+                                    <label for="DB_USER">User</label>
+                                    <input type="text" id="DB_USER" name="DB_USER" placeholder="admin">
+                                </div>
+                                <div class="field">
+                                    <label for="DB_PASSWORD">Password</label>
+                                    <input type="password" id="DB_PASSWORD" name="DB_PASSWORD" placeholder="admin">
+                                </div>
                             </div>
-                            <div class="form-group flex-1">
-                                <label for="DB_PASSWORD">Password</label>
-                                <input type="password" id="DB_PASSWORD" name="DB_PASSWORD" placeholder="admin">
-                            </div>
                         </div>
-                    </div>
 
-                    <!-- SQLite Split Configuration Group -->
-                    <div id="sqlite-config-group" class="db-group">
-                        <div class="form-row">
-                            <div class="form-group flex-2">
-                                <label for="SQLITE_PATH">SQLite Database File Path</label>
+                        <div id="sqlite-config-group" class="db-group" style="display: none;">
+                            <div class="field">
+                                <label for="SQLITE_PATH">SQLite file path</label>
                                 <input type="text" id="SQLITE_PATH" name="SQLITE_PATH" placeholder="janome_jp4_data.db">
                             </div>
                         </div>
+
+                        <button type="button" id="btn-test-db" class="btn btn-secondary btn-small">Test database connection</button>
                     </div>
+                </details>
 
-                    <div class="test-btn-row">
-                        <button type="button" id="btn-test-db" class="btn-secondary">
-                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
-                                <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
-                                <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
-                                <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
-                            </svg>
-                            <span>TEST DATABASE CONNECTION</span>
-                        </button>
-                    </div>
-
-                    <div class="form-actions">
-                        <button type="submit" id="btn-save-config" class="btn-primary">
-                            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
-                                <polyline points="17 21 17 13 7 13 7 21"></polyline>
-                                <polyline points="7 3 7 8 15 8"></polyline>
-                            </svg>
-                            <span>SAVE CONFIGURATION</span>
-                        </button>
-                    </div>
-                </form>
-            </section>
-
-            <!-- Right Panel: Control Actions & Real-time Terminal Log Console -->
-            <section class="console-panel">
-                <!-- Action Controls -->
-                <div class="action-card">
-                    <div class="panel-header">
-                        <h2>PROCESS CONTROL & EXECUTION</h2>
-                        <span class="panel-subtitle">Activate read-only telemetry ingestion stream</span>
-                    </div>
-
-                    <div class="control-grid">
-                        <button type="button" id="btn-start-real" class="btn-action btn-start">
-                            <div class="btn-content">
-                                <svg viewBox="0 0 24 24" width="22" height="22" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
-                                    <polygon points="5 3 19 12 5 21 5 3"></polygon>
-                                </svg>
-                                <div class="btn-text-group">
-                                    <span class="btn-title">START REAL INGESTION</span>
-                                    <span class="btn-desc">RS-232 Physical Press Hardware (read-only)</span>
-                                </div>
-                            </div>
-                        </button>
-
-                        <button type="button" id="btn-start-mock" class="btn-action btn-mock">
-                            <div class="btn-content">
-                                <svg viewBox="0 0 24 24" width="22" height="22" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
-                                    <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-                                    <line x1="8" y1="21" x2="16" y2="21"></line>
-                                    <line x1="12" y1="17" x2="12" y2="21"></line>
-                                </svg>
-                                <div class="btn-text-group">
-                                    <span class="btn-title">START MOCK MODE</span>
-                                    <span class="btn-desc">Driverless Synthetic Simulation</span>
-                                </div>
-                            </div>
-                        </button>
-
-                        <button type="button" id="btn-stop" class="btn-action btn-stop" disabled>
-                            <div class="btn-content">
-                                <svg viewBox="0 0 24 24" width="22" height="22" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
-                                    <rect x="6" y="6" width="12" height="12" rx="1" ry="1"></rect>
-                                </svg>
-                                <div class="btn-text-group">
-                                    <span class="btn-title">STOP INGESTION</span>
-                                    <span class="btn-desc">Graceful process termination</span>
-                                </div>
-                            </div>
-                        </button>
-                    </div>
-                </div>
-
-                <!-- Console Terminal View -->
-                <div class="terminal-card">
-                    <div class="terminal-header">
-                        <div class="terminal-title">
-                            <span class="terminal-dot"></span>
-                            <span>REALTIME PIPELINE LOG CONSOLE</span>
-                        </div>
-                        <div class="terminal-actions">
-                            <span class="log-indicator monospace" id="log-indicator">CONNECTED</span>
-                            <button type="button" id="btn-clear-log" class="btn-clear" title="Clear Console View">CLEAR</button>
+                <details class="section">
+                    <summary>Startup</summary>
+                    <div class="section-body">
+                        <label class="check" for="AUTO_START_ON_STARTUP">
+                            <input type="checkbox" id="AUTO_START_ON_STARTUP" name="AUTO_START_ON_STARTUP">
+                            <span>Start reading automatically when the panel starts</span>
+                        </label>
+                        <div class="field">
+                            <label for="AUTO_START_MODE">Automatic start mode</label>
+                            <select id="AUTO_START_MODE" name="AUTO_START_MODE">
+                                <option value="mockup">Simulation</option>
+                                <option value="real">Read from the press</option>
+                            </select>
                         </div>
                     </div>
-                    <div class="terminal-body monospace" id="terminal-body">
-                        <div class="log-line sys-line">[SYSTEM] Initializing Janome JP4 Web Console...</div>
-                    </div>
+                </details>
+
+                <div class="form-actions">
+                    <button type="submit" id="btn-save-config" class="btn btn-primary">Save settings</button>
                 </div>
-            </section>
-        </div>
-    </div>
+            </form>
+        </aside>
+    </main>
 
     <script src="/static/app.js"></script>
 </body>

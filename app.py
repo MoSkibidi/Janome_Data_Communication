@@ -5,6 +5,7 @@
 try:
     import eventlet
     eventlet.monkey_patch()
+    import eventlet.tpool  # used by the log tail thread; not loaded by "import eventlet" alone
 except Exception as _e:
     print(f"[WARNING] Eventlet initialization warning: {_e}")
 
@@ -160,7 +161,7 @@ def terminate_pid(pid):
 
 # E.g.: [STATS] polled=1 | written=1 | db_errors=0 | encoder_position_mm=41.5 | teaching_position_mm=41.5 | load_n=512.3
 STATS_REGEX = re.compile(
-    r"\[STATS\] polled=(?P<polled>[0-9,]+) \| written=(?P<written>[0-9,]+) \| db_errors=(?P<errors>[0-9]+) \| encoder_position_mm=(?P<encoder>-?[0-9\.]+) \| teaching_position_mm=(?P<teach>-?[0-9\.]+) \| load_n=(?P<load>-?[0-9\.]+)"
+    r"\[STATS\] polled=(?P<polled>[0-9,]+) \| written=(?P<written>[0-9,]+) \| db_errors=(?P<errors>[0-9]+) \| encoder_position_mm=(?P<encoder>-?[0-9\.]+) \| teaching_position_mm=(?P<teach>-?[0-9\.]+) \| load_n=(?P<load>-?[0-9\.]+)(?: \| db_state=(?P<db_state>\w+) \| db_pending=(?P<db_pending>[0-9]+) \| db_dropped=(?P<db_dropped>[0-9]+))?"
 )
 
 def parse_and_emit_stats(line):
@@ -175,6 +176,9 @@ def parse_and_emit_stats(line):
             'encoder_position_mm': match.group('encoder'),
             'teaching_position_mm': match.group('teach'),
             'load_n': match.group('load'),
+            'db_state': match.group('db_state'),
+            'db_pending': match.group('db_pending'),
+            'db_dropped': match.group('db_dropped'),
         }
         socketio.emit('stats_update', last_stats)
 
