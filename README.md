@@ -77,6 +77,21 @@ python app.py
 Then open `http://localhost:8085`. Configure the database target and serial
 port in the panel, then start real or mock ingestion.
 
+**Windows background run:** `run.bat` starts the panel hidden (logs in
+`logs\panel.log`) and `stop.bat` stops it.
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JANOME_PORT` | `8085` | Port the control panel listens on. |
+| `JANOME_HOST` | `0.0.0.0` | Interface the control panel binds to. |
+| `JANOME_DATA_DIR` | project folder | Where `config.json`, PID/state files, the pipeline log and the SQLite DB are written. Point it at a mounted volume in a container. If `config.json` is missing there, the bundled one is copied in on first start. |
+
+The serial port is set in `config.json` (via the panel). In a container, pass
+the device through (for example `/dev/ttyUSB0`) and set that path as the
+serial port.
+
 ## Commands implemented
 
 Read-only (safe, cannot move the press): `B0` (system info), `N0`/`N1`

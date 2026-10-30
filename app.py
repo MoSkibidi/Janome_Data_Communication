@@ -14,6 +14,7 @@ import json
 import subprocess
 import threading
 import re
+import shutil
 import time
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
@@ -22,11 +23,22 @@ app = Flask(__name__, template_folder='templates', static_folder='static')
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
-PID_PATH = os.path.join(BASE_DIR, '.janome_jp4_process.pid')
-MODE_PATH = os.path.join(BASE_DIR, '.janome_jp4_process.mode')
-DESIRED_STATE_PATH = os.path.join(BASE_DIR, '.janome_jp4_desired_state.json')
-LOG_PATH = os.path.join(BASE_DIR, 'janome_jp4_pipeline.log')
+
+# Writable runtime files (config, PID, state, log, SQLite DB) live in DATA_DIR.
+# Defaults to the project folder; set JANOME_DATA_DIR to a mounted volume in a container.
+DATA_DIR = os.path.abspath(os.environ.get('JANOME_DATA_DIR', BASE_DIR))
+os.makedirs(DATA_DIR, exist_ok=True)
+
+CONFIG_PATH = os.path.join(DATA_DIR, 'config.json')
+PID_PATH = os.path.join(DATA_DIR, '.janome_jp4_process.pid')
+MODE_PATH = os.path.join(DATA_DIR, '.janome_jp4_process.mode')
+DESIRED_STATE_PATH = os.path.join(DATA_DIR, '.janome_jp4_desired_state.json')
+LOG_PATH = os.path.join(DATA_DIR, 'janome_jp4_pipeline.log')
+
+# Seed an empty data dir with the bundled config (its serial settings differ from the built-in defaults).
+_SEED_CONFIG = os.path.join(BASE_DIR, 'config.json')
+if not os.path.exists(CONFIG_PATH) and os.path.exists(_SEED_CONFIG):
+    shutil.copyfile(_SEED_CONFIG, CONFIG_PATH)
 
 tail_thread = None
 stop_tail_event = threading.Event()
@@ -351,7 +363,7 @@ def test_db():
         try:
             import sqlite3
             db_name = db_cfg.get('sqlite_path') or db_cfg.get('db_name', 'janome_jp4_data.db')
-            db_path = db_name if os.path.isabs(db_name) else os.path.join(BASE_DIR, db_name)
+            db_path = db_name if os.path.isabs(db_name) else os.path.join(DATA_DIR, db_name)
             conn = sqlite3.connect(db_path)
             conn.close()
             return jsonify({'success': True, 'message': f'SQLite connection to {db_name} successful!'})
@@ -430,6 +442,7 @@ def handle_start(data=None):
             stdout=log_file,
             stderr=subprocess.STDOUT,
             env=env,
+            cwd=DATA_DIR,
         )
         if sys.platform != "win32":
             popen_kwargs["close_fds"] = True
@@ -506,5 +519,10 @@ else:
         print("[SYSTEM] Startup config auto_start_on_startup is disabled. Awaiting manual start trigger.")
 
 if __name__ == '__main__':
-    # Served on Port 8085
-    socketio.run(app, host='0.0.0.0', port=8085, debug=False)
+    # Served on Port 8085 unless JANOME_HOST / JANOME_PORT override it
+    socketio.run(
+        app,
+        host=os.environ.get('JANOME_HOST', '0.0.0.0'),
+        port=int(os.environ.get('JANOME_PORT', '8085')),
+        debug=False,
+    )
