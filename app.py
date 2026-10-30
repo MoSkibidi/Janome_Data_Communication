@@ -17,8 +17,10 @@ import threading
 import re
 import shutil
 import time
-from flask import Flask, render_template, jsonify, request
+from datetime import datetime, timezone
+from flask import Flask, render_template, jsonify, request, Response
 from flask_socketio import SocketIO, emit
+from run_summary import RunSummary
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -44,6 +46,7 @@ if not os.path.exists(CONFIG_PATH) and os.path.exists(_SEED_CONFIG):
 tail_thread = None
 stop_tail_event = threading.Event()
 last_stats = {}
+run_summary = RunSummary()  # statistics and samples of the current/last run, kept in memory only
 
 def read_config():
     """Reads configuration parameters from config.json."""
@@ -160,7 +163,7 @@ def terminate_pid(pid):
 
 # E.g.: [STATS] polled=1 | written=1 | db_errors=0 | encoder_position_mm=41.5 | teaching_position_mm=41.5 | load_n=512.3
 STATS_REGEX = re.compile(
-    r"\[STATS\] polled=(?P<polled>[0-9,]+) \| written=(?P<written>[0-9,]+) \| db_errors=(?P<errors>[0-9]+) \| encoder_position_mm=(?P<encoder>-?[0-9\.]+) \| teaching_position_mm=(?P<teach>-?[0-9\.]+) \| load_n=(?P<load>-?[0-9\.]+)(?: \| db_state=(?P<db_state>\w+) \| db_pending=(?P<db_pending>[0-9]+) \| db_dropped=(?P<db_dropped>[0-9]+))?"
+    r"\[STATS\] polled=(?P<polled>[0-9,]+) \| written=(?P<written>[0-9,]+) \| db_errors=(?P<errors>[0-9]+) \| encoder_position_mm=(?P<encoder>-?[0-9\.]+) \| teaching_position_mm=(?P<teach>-?[0-9\.]+) \| load_n=(?P<load>-?[0-9\.]+)(?: \| db_state=(?P<db_state>\w+) \| db_pending=(?P<db_pending>[0-9]+) \| db_dropped=(?P<db_dropped>[0-9]+))?(?: \| time=(?P<time>\S+))?"
 )
 
 def parse_and_emit_stats(line):
@@ -168,6 +171,17 @@ def parse_and_emit_stats(line):
     global last_stats
     match = STATS_REGEX.search(line)
     if match:
+        try:
+            read_at = datetime.fromisoformat(match.group('time')) if match.group('time') else datetime.now(timezone.utc)
+        except ValueError:
+            read_at = datetime.now(timezone.utc)
+        run_summary.add(
+            read_at,
+            float(match.group('encoder')),
+            float(match.group('teach')),
+            float(match.group('load')),
+        )
+        socketio.emit('run_update', run_summary.snapshot())
         last_stats = {
             'polled': match.group('polled'),
             'written': match.group('written'),
@@ -181,8 +195,12 @@ def parse_and_emit_stats(line):
         }
         socketio.emit('stats_update', last_stats)
 
-def tail_log_file():
-    """Background loop tailing the physical log file to feed sockets."""
+def tail_log_file(from_start=False):
+    """Background loop tailing the physical log file to feed sockets.
+
+    from_start=True reads the file from its beginning; used for a run this panel just
+    started, so no early sample is missed. Otherwise only new lines are followed.
+    """
     print("[SYSTEM] Janome JP4 Log tailing thread started.")
 
     while not os.path.exists(LOG_PATH) and not stop_tail_event.is_set():
@@ -190,7 +208,7 @@ def tail_log_file():
 
     try:
         with open(LOG_PATH, 'r', errors='replace') as f:
-            f.seek(0, os.SEEK_END)
+            f.seek(0, os.SEEK_SET if from_start else os.SEEK_END)
 
             while not stop_tail_event.is_set():
                 # is_pid_running() shells out to tasklist on Windows, which
@@ -200,6 +218,8 @@ def tail_log_file():
                 pid, _ = eventlet.tpool.execute(get_running_process)
                 if pid is None:
                     socketio.emit('status_change', {'is_running': False})
+                    run_summary.finish()
+                    socketio.emit('run_update', run_summary.snapshot())
                     if os.path.exists(PID_PATH):
                         try: os.remove(PID_PATH)
                         except: pass
@@ -228,12 +248,12 @@ def tail_log_file():
     finally:
         print("[SYSTEM] Janome JP4 Log tailing thread finished.")
 
-def start_tailing():
+def start_tailing(from_start=False):
     """Starts a new background tailing thread if not active."""
     global tail_thread, stop_tail_event
     stop_tail_event.clear()
     if tail_thread is None or not tail_thread.is_alive():
-        tail_thread = threading.Thread(target=tail_log_file, daemon=True)
+        tail_thread = threading.Thread(target=tail_log_file, args=(from_start,), daemon=True)
         tail_thread.start()
 
 def get_last_logs(count=50):
@@ -337,6 +357,29 @@ def get_status():
         'db_type': cfg.get('database', {}).get('db_type', 'none')
     })
 
+@app.route('/api/run', methods=['GET'])
+def api_run():
+    """Statistics of the current/last run (whole run, Start to Stop)."""
+    return jsonify(run_summary.snapshot())
+
+@app.route('/api/run/samples', methods=['GET'])
+def api_run_samples():
+    """Latest samples of the current/last run, oldest first (default 2000)."""
+    limit = request.args.get('limit', default=2000, type=int)
+    snap = run_summary.snapshot()
+    return jsonify({'samples': run_summary.samples(limit), 'count': snap['count'], 'stored': snap['stored']})
+
+@app.route('/api/run.csv', methods=['GET'])
+def api_run_csv():
+    """Every stored sample of the current/last run as a CSV download."""
+    started = run_summary.snapshot()['started_at'] or ''
+    stamp = re.sub(r'[^0-9]', '', started)[:14] or 'run'
+    return Response(
+        run_summary.csv_text(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename=janome_run_{stamp}.csv'}
+    )
+
 @app.route('/api/scan_serial', methods=['GET'])
 def api_scan_serial():
     """Returns JSON list of detected serial interfaces on host PC."""
@@ -410,6 +453,8 @@ def handle_connect():
     if is_active and last_stats:
         emit('stats_update', last_stats)
 
+    emit('run_update', run_summary.snapshot())
+
     logs = get_last_logs(50)
     for log_line in logs:
         emit('log_update', {'log': log_line})
@@ -466,7 +511,10 @@ def handle_start(data=None):
         socketio.emit('status_change', {'is_running': True, 'mode': run_mode})
         socketio.emit('log_update', {'log': f'[SYSTEM] Spawning Janome JP4 process (PID: {proc.pid}) mode={run_mode.upper()}'})
 
-        start_tailing()
+        run_summary.start(run_mode)  # a new run replaces the previous run's summary
+        socketio.emit('run_update', run_summary.snapshot())
+
+        start_tailing(from_start=True)
 
     except Exception as e:
         socketio.emit('log_update', {'log': f'[SYSTEM] Failed to spawn Janome JP4 process: {e}'})
@@ -477,6 +525,8 @@ def handle_stop():
     pid, _ = get_running_process()
     if pid is None:
         socketio.emit('status_change', {'is_running': False})
+        run_summary.finish()
+        socketio.emit('run_update', run_summary.snapshot())
         emit('log_update', {'log': '[SYSTEM] Warning: Ingestion process is not running. Resetting UI state.'})
         if os.path.exists(PID_PATH):
             try: os.remove(PID_PATH)
@@ -502,6 +552,8 @@ def handle_stop():
         try: os.remove(MODE_PATH)
         except: pass
 
+    run_summary.finish()
+    socketio.emit('run_update', run_summary.snapshot())
     socketio.emit('status_change', {'is_running': False})
     socketio.emit('log_update', {'log': '[SYSTEM] Janome JP4 Ingestion process terminated.'})
 

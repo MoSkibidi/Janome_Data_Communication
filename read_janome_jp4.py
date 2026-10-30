@@ -403,7 +403,7 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                 db_errors = writer.db_errors if writer else 0
                 pending = writer.pending if writer else 0
                 dropped = writer.dropped if writer else 0
-                print(f"[STATS] polled={iteration} | written={written} | db_errors={db_errors} | encoder_position_mm={data['encoder_position_mm']} | teaching_position_mm={data['teaching_position_mm']} | load_n={data['load_n']} | db_state={db_state} | db_pending={pending} | db_dropped={dropped}")
+                print(f"[STATS] polled={iteration} | written={written} | db_errors={db_errors} | encoder_position_mm={data['encoder_position_mm']} | teaching_position_mm={data['teaching_position_mm']} | load_n={data['load_n']} | db_state={db_state} | db_pending={pending} | db_dropped={dropped} | time={read_at.isoformat()}")
                 sys.stdout.flush()
 
             if max_iterations is not None and iteration >= max_iterations:

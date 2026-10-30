@@ -76,6 +76,41 @@
                 <p class="note">This panel only reads position and load. It never sends motion commands to the press.</p>
             </section>
 
+            <!-- Run summary: statistics and samples of the whole run (Start to Stop) -->
+            <section class="card" aria-labelledby="run-title">
+                <div class="card-head">
+                    <h2 id="run-title">Run summary</h2>
+                    <span class="badge badge-idle" id="run-state">No run yet</span>
+                </div>
+                <p class="run-meta" id="run-meta">Start a run to see statistics here. They cover the whole run, from Start to Stop, and stay on screen after you stop.</p>
+
+                <div class="table-wrap">
+                    <table class="data-table stats-table">
+                        <thead>
+                            <tr><th scope="col">Reading</th><th scope="col">Min</th><th scope="col">Max</th><th scope="col">Average</th><th scope="col">Std dev</th><th scope="col">Latest</th></tr>
+                        </thead>
+                        <tbody id="stats-body"></tbody>
+                    </table>
+                </div>
+
+                <details class="samples" id="samples-details">
+                    <summary>All samples <span class="muted" id="samples-count"></span></summary>
+                    <div class="samples-tools">
+                        <button type="button" id="btn-refresh-samples" class="btn-link">Refresh</button>
+                        <a id="link-csv" class="btn-link" href="/api/run.csv" download>Download CSV</a>
+                    </div>
+                    <div class="table-wrap samples-scroll">
+                        <table class="data-table samples-table">
+                            <thead>
+                                <tr><th scope="col">Time</th><th scope="col">Actual position (mm)</th><th scope="col">Programmed position (mm)</th><th scope="col">Load (N)</th></tr>
+                            </thead>
+                            <tbody id="samples-body"></tbody>
+                        </table>
+                    </div>
+                    <p class="note" id="samples-note"></p>
+                </details>
+            </section>
+
             <!-- Log -->
             <section class="card log-card" aria-labelledby="log-title">
                 <div class="log-header">

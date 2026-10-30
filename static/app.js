@@ -15,6 +15,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const elTeaching = document.getElementById('telemetry-teaching');
     const elLoad = document.getElementById('telemetry-load');
     const elDb = document.getElementById('telemetry-db');
+    const MAX_LOG_LINES = 1000;
 
     // DOM Elements - Form Fields
     const configForm = document.getElementById('config-form');
@@ -313,8 +314,140 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         div.textContent = lineText;
         terminalBody.appendChild(div);
+        // Keep the page light during long runs: only the most recent lines stay in the view
+        while (terminalBody.childElementCount > MAX_LOG_LINES) {
+            terminalBody.removeChild(terminalBody.firstChild);
+        }
         terminalBody.scrollTop = terminalBody.scrollHeight;
     }
+
+    // ---------- Run summary (statistics + samples of the whole run, Start to Stop) ----------
+    const RUN_SIGNALS = [
+        { key: 'encoder_position_mm', label: 'Actual position', unit: 'mm', dp: 4 },
+        { key: 'teaching_position_mm', label: 'Programmed position', unit: 'mm', dp: 4 },
+        { key: 'load_n', label: 'Load', unit: 'N', dp: 1 }
+    ];
+    const SAMPLE_ROWS_SHOWN = 2000;
+
+    const elRunState = document.getElementById('run-state');
+    const elRunMeta = document.getElementById('run-meta');
+    const elStatsBody = document.getElementById('stats-body');
+    const elSamplesDetails = document.getElementById('samples-details');
+    const elSamplesCount = document.getElementById('samples-count');
+    const elSamplesBody = document.getElementById('samples-body');
+    const elSamplesNote = document.getElementById('samples-note');
+    const btnRefreshSamples = document.getElementById('btn-refresh-samples');
+    let lastRunState = 'idle';
+
+    function formatClock(iso) {
+        const d = new Date(iso);
+        const p = (n, w = 2) => String(n).padStart(w, '0');
+        return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+    }
+
+    function formatDuration(seconds) {
+        const s = Math.max(0, Math.round(seconds));
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
+        const mm = String(m).padStart(2, '0');
+        const ss = String(sec).padStart(2, '0');
+        return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+    }
+
+    function renderRun(run) {
+        if (!run) return;
+
+        const badges = {
+            idle: ['badge badge-idle', 'No run yet'],
+            running: [run.mode === 'real' ? 'badge badge-running' : 'badge badge-sim',
+                      run.mode === 'real' ? 'Running' : 'Running (simulation)'],
+            finished: ['badge badge-finished', run.mode === 'real' || !run.mode ? 'Finished' : 'Finished (simulation)']
+        };
+        const [badgeClass, badgeText] = badges[run.state] || badges.idle;
+        elRunState.className = badgeClass;
+        elRunState.textContent = badgeText;
+
+        if (run.state === 'idle') {
+            elRunMeta.textContent = 'Start a run to see statistics here. They cover the whole run, from Start to Stop, and stay on screen after you stop.';
+        } else {
+            const parts = [
+                `Started ${new Date(run.started_at).toLocaleTimeString([], { hour12: false })}`,
+                `${run.state === 'running' ? 'Running for' : 'Lasted'} ${formatDuration(run.duration_s)}`,
+                `${run.count.toLocaleString()} readings`
+            ];
+            elRunMeta.textContent = parts.join('  ·  ');
+            if (run.truncated) {
+                elRunMeta.textContent += `  ·  statistics cover all readings; the table keeps the latest ${run.stored.toLocaleString()}`;
+            }
+        }
+
+        elStatsBody.innerHTML = '';
+        RUN_SIGNALS.forEach(sig => {
+            const st = run.stats ? run.stats[sig.key] : null;
+            const tr = document.createElement('tr');
+            const cell = (text, cls) => {
+                const td = document.createElement('td');
+                td.textContent = text;
+                if (cls) td.className = cls;
+                return td;
+            };
+            const nameTd = document.createElement('td');
+            nameTd.innerHTML = `${sig.label}<span class="unit">${sig.unit}</span>`;
+            tr.appendChild(nameTd);
+            ['min', 'max', 'mean', 'std', 'last'].forEach(k => {
+                tr.appendChild(cell(st ? st[k].toFixed(sig.dp) : '–'));
+            });
+            elStatsBody.appendChild(tr);
+        });
+
+        elSamplesCount.textContent = run.count ? `(${run.count.toLocaleString()})` : '';
+
+        // Refresh the sample table once when a run ends so it shows the final data
+        if (lastRunState === 'running' && run.state !== 'running' && elSamplesDetails.open) {
+            loadSamples();
+        }
+        lastRunState = run.state;
+    }
+
+    async function loadSamples() {
+        try {
+            const res = await fetch(`/api/run/samples?limit=${SAMPLE_ROWS_SHOWN}`);
+            const data = await res.json();
+            const rows = data.samples || [];
+            const frag = document.createDocumentFragment();
+            // Newest first, so the latest readings are visible without scrolling
+            for (let i = rows.length - 1; i >= 0; i--) {
+                const [iso, enc, teach, load] = rows[i];
+                const tr = document.createElement('tr');
+                [formatClock(iso), enc.toFixed(4), teach.toFixed(4), load.toFixed(1)].forEach(text => {
+                    const td = document.createElement('td');
+                    td.textContent = text;
+                    tr.appendChild(td);
+                });
+                frag.appendChild(tr);
+            }
+            elSamplesBody.innerHTML = '';
+            elSamplesBody.appendChild(frag);
+
+            if (!rows.length) {
+                elSamplesNote.textContent = 'No readings yet.';
+            } else if (data.count > rows.length) {
+                elSamplesNote.textContent = `Showing the latest ${rows.length.toLocaleString()} of ${data.count.toLocaleString()} readings. Download the CSV for all of them.`;
+            } else {
+                elSamplesNote.textContent = `Showing all ${rows.length.toLocaleString()} readings, newest first.`;
+            }
+        } catch (err) {
+            elSamplesNote.textContent = `Could not load readings: ${err.message}`;
+        }
+    }
+
+    elSamplesDetails.addEventListener('toggle', () => { if (elSamplesDetails.open) loadSamples(); });
+    btnRefreshSamples.addEventListener('click', loadSamples);
+    // While a run is going and the table is open, keep it current
+    setInterval(() => {
+        if (elSamplesDetails.open && lastRunState === 'running') loadSamples();
+    }, 3000);
 
     // Socket.IO Handlers
     socket.on('connect', () => {
@@ -353,6 +486,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (stats.load_n) elLoad.textContent = stats.load_n;
         if (stats.db_state) showDbState(stats.db_state, stats.db_pending);
     });
+
+    socket.on('run_update', renderRun);
 
     socket.on('log_update', (data) => {
         if (data && data.log) {

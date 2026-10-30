@@ -245,6 +245,67 @@ input:focus-visible, select:focus-visible, summary:focus-visible {
 
 .note { margin-top: 14px; font-size: 0.875rem; color: var(--muted); }
 
+/* ---------- Run summary ---------- */
+.card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+.card-head h2 { font-size: 1rem; font-weight: 600; margin: 0; }
+
+.badge {
+    padding: 3px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    font-size: 0.875rem;
+    font-weight: 600;
+    white-space: nowrap;
+}
+.badge-idle { background: var(--surface-alt); color: var(--muted); }
+.badge-running { background: var(--ok-bg); border-color: #b9dcc5; color: var(--ok); }
+.badge-sim { background: var(--warn-bg); border-color: #ecd9a0; color: var(--warn); }
+.badge-finished { background: var(--surface-alt); border-color: var(--border-strong); color: var(--text); }
+
+.run-meta { font-size: 0.9375rem; color: var(--muted); margin-bottom: 12px; }
+.muted { color: var(--muted); font-weight: 400; }
+
+.table-wrap { overflow-x: auto; }
+
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9375rem;
+    font-variant-numeric: tabular-nums;
+}
+.data-table th, .data-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    text-align: right;
+    white-space: nowrap;
+}
+.data-table th:first-child, .data-table td:first-child { text-align: left; }
+.data-table th { color: var(--muted); font-weight: 600; font-size: 0.8125rem; background: var(--surface-alt); }
+.data-table td { font-family: var(--mono); }
+.data-table td:first-child { font-family: var(--font); }
+.stats-table td:first-child { font-weight: 600; }
+.stats-table .unit { color: var(--muted); font-weight: 400; margin-left: 4px; font-size: 0.8125rem; }
+/* Keep all six statistics columns visible on a tablet or narrow window */
+.stats-table th, .stats-table td { padding: 8px 6px; }
+.stats-table td:not(:first-child) { font-size: 0.875rem; }
+.stats-table td:first-child, .stats-table th:first-child { white-space: normal; }
+.stats-table .unit { display: block; margin-left: 0; }
+
+.samples { margin-top: 14px; border-top: 1px solid var(--border); }
+.samples summary { min-height: 44px; display: flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
+.samples-tools { display: flex; gap: 16px; margin-bottom: 8px; }
+.samples-tools a.btn-link { text-decoration: none; }
+.samples-tools a.btn-link:hover { text-decoration: underline; }
+.samples-scroll { max-height: 320px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+.samples-scroll .data-table th { position: sticky; top: 0; z-index: 1; }
+.samples-scroll .data-table tr:last-child td { border-bottom: 0; }
+
 /* ---------- Log ---------- */
 .log-header {
     display: flex;

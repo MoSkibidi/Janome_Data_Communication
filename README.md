@@ -34,6 +34,7 @@ has been verified live against a real JP4 press:
 |---|---|
 | `read_janome_jp4.py` | Core driver: builds/parses protocol frames, reads position/load telemetry, writes to a database on an interval. Also usable standalone via CLI (`--mock` for driver-free testing, `--once` for a single read). |
 | `database_handler.py` | SQLite/PostgreSQL/InfluxDB storage backend for the ingestion driver. |
+| `run_summary.py` | In-memory statistics and samples of the current/last run (Run summary card, CSV download). |
 | `app.py` | Flask-SocketIO web control panel (port 8085) - configure the serial port, start/stop real or mock ingestion, view live telemetry. |
 | `quick_test.py` | Minimal standalone CLI script - opens the port, sends a few commands, prints raw TX/RX bytes. No Flask/database dependency. |
 | `serial_test_webapp.py` | Full diagnostic web app (port 8086) - command picker covering all read/control commands in plain language, a Poll Set for program settings (S2), a one-shot Quality Data capture, and a **Live Cycle Monitor** that logs every completed press cycle automatically (with link keep-alive). |
@@ -115,6 +116,27 @@ The database engine is chosen in the panel (`database.db_type` in `config.json`)
     actually committed.
 - The tables are created as plain tables. A TimescaleDB hypertable is not
   created automatically.
+
+## Run summary (temporary data of a run)
+
+The panel keeps the readings of the current or last run in memory and shows a
+**Run summary** card: min, max, average, standard deviation and latest value of
+actual position, programmed position and load, plus a table of every reading.
+
+- A run is everything from **Start** (or **Start simulation**) to **Stop**.
+  Statistics cover the whole run, however long it is. They stay on screen after
+  Stop, until the next Start replaces them.
+- Data is **memory only**. It is lost when the panel restarts and nothing is
+  written to disk (the database setting is independent of this).
+- The table keeps the latest 50,000 readings (`RunSummary(max_samples=...)` in
+  `app.py`). Statistics still cover every reading; the card says so when older
+  readings were dropped. The browser shows the latest 2,000 rows.
+- **Download CSV** (`/api/run.csv`, times in UTC) gives all stored readings.
+  JSON endpoints: `/api/run` (summary) and `/api/run/samples?limit=N`.
+- Each `[STATS]` line from the reader ends with `time=<ISO time>`, the moment the
+  reading was taken; the panel uses it for the sample timestamps.
+- If the panel starts while a reader is already running, the summary begins at
+  that moment.
 
 ## Environment variables
 
