@@ -58,7 +58,7 @@ def read_config():
             "timeout": 2.0
         },
         "database": {
-            "db_type": "sqlite",
+            "db_type": "none",
             "db_name": "janome_jp4_data.db",
             "table_name": "janome_jp4_telemetry",
             "host": "localhost",
@@ -331,7 +331,7 @@ def get_status():
         'is_running': pid is not None,
         'run_mode': mode or 'mockup',
         'serial_port': cfg.get('serial', {}).get('port', 'N/A'),
-        'db_type': cfg.get('database', {}).get('db_type', 'sqlite')
+        'db_type': cfg.get('database', {}).get('db_type', 'none')
     })
 
 @app.route('/api/scan_serial', methods=['GET'])
@@ -348,7 +348,10 @@ def api_scan_serial():
 def test_db():
     req = request.get_json() or {}
     db_cfg = req.get('database') or read_config().get('database', {})
-    db_type = db_cfg.get('db_type', 'sqlite')
+    db_type = db_cfg.get('db_type', 'none')
+
+    if db_type == 'none':
+        return jsonify({'success': True, 'message': 'No database selected - samples are shown in the log only and are not stored.'})
 
     if db_type in ('postgresql', 'timescaledb'):
         try:

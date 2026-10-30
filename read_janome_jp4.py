@@ -7,7 +7,7 @@ import sys
 import argparse
 import logging
 import datetime
-from database_handler import DatabaseHandler
+from database_handler import DatabaseHandler, BufferedDatabaseWriter, DiskSpool
 
 # Ensure UTF-8 output encoding on Windows consoles to prevent UnicodeEncodeError
 if hasattr(sys.stdout, 'reconfigure'):
@@ -307,43 +307,74 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
     print("=" * 65)
     print("      JANOME Electro Press JP4 Telemetry Ingestion Service      ")
     print("=" * 65)
-    print(f"  Mode:          {'MOCK (Synthetic Hardware Simulation)' if mock_mode else 'REAL (Physical Hardware RS-232, JP5 protocol - unverified on JP4)'}")
+    db_type = str(db_cfg.get("db_type") or "none").lower()
+    log_only = db_type == "none"
+
+    print(f"  Mode:          {'MOCK (Synthetic Hardware Simulation)' if mock_mode else 'REAL (Physical Hardware RS-232)'}")
     print(f"  Serial Port:   {port} @ {baudrate} bps")
     print(f"  Interval Time: {interval_time} seconds")
-    print(f"  DB Type:       {db_cfg.get('db_type', 'sqlite')}")
-    print(f"  DB Name:       {db_cfg.get('db_name', 'janome_jp4_data.db')}")
-    print(f"  Table Name:    {db_cfg.get('table_name', 'janome_jp4_telemetry')}")
+    if log_only:
+        print("  Database:      NONE (log only - samples are not stored)")
+    else:
+        print(f"  DB Type:       {db_type}")
+        print(f"  DB Name:       {db_cfg.get('db_name', 'janome_jp4_data.db')}")
+        print(f"  Table Name:    {db_cfg.get('table_name', 'janome_jp4_telemetry')}")
     print("=" * 65)
 
     press = None
-    db_handler = None
+    writer = None
 
     try:
+        # Check the database first so a bad DB setting fails fast, before the serial port is opened
+        if not log_only:
+            spool_path = db_cfg.get("spool_path") or os.path.join(
+                os.path.dirname(os.path.abspath(config_path)), "janome_jp4_spool.db"
+            )
+            spool = DiskSpool(spool_path, max_rows=int(db_cfg.get("max_spool_rows", 1000000)))
+            db_connected = True
+            try:
+                db_handler = DatabaseHandler(db_cfg)
+            except Exception as err:
+                where = f"{db_type} database '{db_cfg.get('db_name')}' at {db_cfg.get('host')}:{db_cfg.get('port')}"
+                if spool.count == 0:
+                    logger.error(f"[DB ERROR] Cannot connect to {where}: {err}")
+                    logger.error("[DB ERROR] Ingestion not started. Fix the database settings or set the database to 'None (log only)'.")
+                    spool.close()
+                    return 2
+                # Samples from an earlier run are still waiting on disk: keep collecting, send everything once the DB is back
+                logger.warning(f"[DB] Cannot connect to {where}: {err}")
+                logger.warning(f"[DB] {spool.count} sample(s) from an earlier run are waiting in '{spool_path}'. Starting anyway; samples are spooled until the database is reachable.")
+                db_handler = DatabaseHandler(db_cfg, connect=False)
+                db_connected = False
+            else:
+                if spool.count:
+                    logger.info(f"[DB] Sending {spool.count} sample(s) left in '{spool_path}' by an earlier run.")
+            writer = BufferedDatabaseWriter(
+                db_handler,
+                spool,
+                max_buffer=int(db_cfg.get("max_buffer", 100000)),
+                retry_interval=float(db_cfg.get("retry_interval", 5.0)),
+                connected=db_connected,
+            )
+
         if mock_mode:
             press = MockJanomeJP4Press(port="MOCK", baudrate=baudrate, timeout=timeout)
         else:
             press = JanomeJP4Press(port=port, baudrate=baudrate, timeout=timeout)
-
-        db_handler = DatabaseHandler(db_cfg)
 
         iteration = 0
         print(f"\nStarting data collection loop (interval: {interval_time}s). Press Ctrl+C to stop.\n")
 
         while True:
             iteration += 1
-            timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+            read_at = datetime.datetime.now(datetime.timezone.utc)
+            timestamp_str = read_at.strftime("%Y-%m-%d %H:%M:%S %Z")
             print(f"[{timestamp_str}] [Loop #{iteration}] Polling press telemetry...")
 
             try:
                 data = press.read_telemetry()
-                row_id = db_handler.insert_telemetry(data)
-
-                print(f"  -> Success! Stored record #{row_id} in database.")
-                print(f"     Encoder Position: {data['encoder_position_mm']} mm | Teaching Position: {data['teaching_position_mm']} mm | Load: {data['load_n']} N")
-                print(f"[STATS] polled={iteration} | written={iteration} | db_errors=0 | encoder_position_mm={data['encoder_position_mm']} | teaching_position_mm={data['teaching_position_mm']} | load_n={data['load_n']}")
-                sys.stdout.flush()
             except Exception as err:
-                logger.error(f"Error acquiring or saving data: {err}")
+                logger.error(f"Error reading telemetry from press: {err}")
                 sys.stdout.flush()
                 if not mock_mode:
                     logger.warning(
@@ -354,6 +385,24 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                         f"          consistently fail, JP4 firmware may use a different protocol.\n"
                         f"       4. To run in driver-free simulation mode, use: python read_janome_jp4.py --mock"
                     )
+            else:
+                if writer:
+                    writer.submit(data, read_at)
+                    db_state = "connected" if writer.connected else "down"
+                    if writer.connected:
+                        print("  -> Success! Sample read; queued for database.")
+                    else:
+                        print(f"  -> Success! Sample read; DATABASE DOWN - {writer.pending} sample(s) spooled to disk, retrying.")
+                else:
+                    db_state = "none"
+                    print("  -> Success! Sample read (log only, not stored).")
+                print(f"     Encoder Position: {data['encoder_position_mm']} mm | Teaching Position: {data['teaching_position_mm']} mm | Load: {data['load_n']} N")
+                written = writer.written if writer else 0
+                db_errors = writer.db_errors if writer else 0
+                pending = writer.pending if writer else 0
+                dropped = writer.dropped if writer else 0
+                print(f"[STATS] polled={iteration} | written={written} | db_errors={db_errors} | encoder_position_mm={data['encoder_position_mm']} | teaching_position_mm={data['teaching_position_mm']} | load_n={data['load_n']} | db_state={db_state} | db_pending={pending} | db_dropped={dropped}")
+                sys.stdout.flush()
 
             if max_iterations is not None and iteration >= max_iterations:
                 print(f"\nReached target iterations limit ({max_iterations}). Exiting loop.")
@@ -366,12 +415,14 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
         print("\n[STOP] Ingestion loop stopped by user (KeyboardInterrupt). Exiting...")
     except Exception as err:
         logger.error(f"Service encountered an error: {err}")
+        return 1
     finally:
         if press:
             press.close()
-        if db_handler:
-            db_handler.close()
+        if writer:
+            writer.close()
         print("Service shutdown complete.")
+    return 0
 
 
 if __name__ == "__main__":
@@ -385,10 +436,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     max_iter = 1 if args.once else None
-    run_ingestion_loop(
+    sys.exit(run_ingestion_loop(
         config_path=args.config,
         max_iterations=max_iter,
         override_interval=args.interval,
         override_port=args.port,
         mock_mode=args.mock
-    )
+    ))

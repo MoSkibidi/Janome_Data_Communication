@@ -11,7 +11,7 @@
     "timeout": 2
   },
   "database": {
-    "db_type": "sqlite",
+    "db_type": "none",
     "db_name": "janome_jp4_data.db",
     "table_name": "janome_jp4_telemetry",
     "host": "localhost",

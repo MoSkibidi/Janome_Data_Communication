@@ -60,7 +60,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // Toggle Postgres vs SQLite Form Fields
     function updateDbFieldsVisibility() {
         const val = dbTypeSelect.value;
-        if (val === 'postgresql') {
+        if (val === 'none') {
+            if (postgresGroup) postgresGroup.style.display = 'none';
+            if (sqliteGroup) sqliteGroup.style.display = 'none';
+        } else if (val === 'postgresql') {
             if (postgresGroup) postgresGroup.style.display = 'block';
             if (sqliteGroup) sqliteGroup.style.display = 'none';
         } else {
@@ -86,7 +89,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (acqInterval) acqInterval.value = acq.interval_time || 1.0;
 
             const db = data.database || {};
-            if (dbTypeSelect) dbTypeSelect.value = db.db_type || 'sqlite';
+            if (dbTypeSelect) dbTypeSelect.value = db.db_type || 'none';
             if (dbNameInput) dbNameInput.value = db.db_name || 'janome_jp4_data';
             if (dbHostInput) dbHostInput.value = db.host || 'localhost';
             if (dbPortInput) dbPortInput.value = db.port || 5432;

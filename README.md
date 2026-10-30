@@ -80,6 +80,42 @@ port in the panel, then start real or mock ingestion.
 **Windows background run:** `run.bat` starts the panel hidden (logs in
 `logs\panel.log`) and `stop.bat` stops it.
 
+## Database behaviour
+
+The database engine is chosen in the panel (`database.db_type` in `config.json`):
+
+- **`none` (default, "log only"):** samples are read and shown in the log only;
+  nothing is stored and no database file is created. The pipeline log is
+  overwritten each time ingestion is started, so it only holds the current run.
+- **`sqlite` / `postgresql` (PostgreSQL or TimescaleDB):**
+  - The connection is checked when ingestion starts. If it fails, a
+    `[DB ERROR]` line is logged and ingestion does **not** start (exit code 2).
+  - Serial polling never waits on the database. Samples are queued in memory
+    with the time they were read and written by a background thread.
+  - **Disk spool:** when the database is unreachable, queued samples are moved
+    at once into `janome_jp4_spool.db` (a small SQLite file next to
+    `config.json`, so it lives in `JANOME_DATA_DIR`). The writer retries every
+    5 s; after reconnecting it replays the spool first, then newer samples, in
+    order and with their original read timestamps. Rows leave the spool only
+    after the database has committed them, so a crash, forced kill or power
+    loss does not lose spooled samples.
+  - **After a crash/restart:** leftover spool rows are sent on the next start.
+    If the database is still down but the spool is not empty, ingestion starts
+    anyway and keeps spooling. With an empty spool and no database, it refuses
+    to start as described above.
+  - **Limits of the guarantee:** samples still in memory at the instant of a
+    crash (normally under a second; up to one reconnect attempt, about 5 s,
+    while the database is down) are lost. A crash while replaying can send the
+    last batch (at most 500 rows) twice, because the table has no unique key.
+  - Optional keys in `database`: `max_buffer` (in-memory samples), `max_spool_rows`
+    (default 1,000,000; oldest dropped beyond that), `spool_path`,
+    `retry_interval` (seconds), `connect_timeout` (seconds, PostgreSQL only).
+  - The `[STATS]` line reports `db_state` (`connected`/`down`/`none`),
+    `db_pending` (memory + spool) and `db_dropped`; `written` counts rows
+    actually committed.
+- The tables are created as plain tables. A TimescaleDB hypertable is not
+  created automatically.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
