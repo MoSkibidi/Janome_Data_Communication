@@ -38,6 +38,8 @@ has been verified live against a real JP4 press:
 | `app.py` | Flask-SocketIO web control panel (port 8085) - configure the serial port, start/stop real or mock ingestion, view live telemetry. |
 | `quick_test.py` | Minimal standalone CLI script - opens the port, sends a few commands, prints raw TX/RX bytes. No Flask/database dependency. |
 | `serial_test_webapp.py` | Full diagnostic web app (port 8086) - command picker covering all read/control commands in plain language, a Poll Set for program settings (S2), a one-shot Quality Data capture, and a **Live Cycle Monitor** that logs every completed press cycle automatically (with link keep-alive). |
+| `run_service.bat`, `deploy/` | Foreground launcher plus auto-start at boot: `install_autostart.ps1` / `uninstall_autostart.ps1` (Windows scheduled task) and `janome-panel.service` (Linux systemd). |
+| `tests/test_fail_cases.py` | Fault-injection tests (fake press, fake InfluxDB): cable pulled, press power-cycle, NG cycle, network outage, restart with spool, retention. |
 | `config.json` | Serial port, baud rate, database, and startup settings for `read_janome_jp4.py` / `app.py`. |
 
 ## Setup
@@ -81,6 +83,33 @@ port in the panel, then start real or mock ingestion.
 **Windows background run:** `run.bat` starts the panel hidden (logs in
 `logs\panel.log`) and `stop.bat` stops it.
 
+## Fail cases and how the program handles them
+
+| # | Situation | What happens |
+|---|---|---|
+| 1 | RS-232 cable pulled / USB adapter unplugged | The reader never exits. It logs `[LINK] state=port_unavailable`, retries opening the port every 5 s (`acquisition.reconnect_interval`) and carries on by itself when the port is back. Also covers a port that is missing at start. |
+| 2 | Press reports NG or an emergency stop | Every finished cycle (OK or NG) is read from the press's Quality Data (`V1`) push frame, shown in **Press cycles**, logged (`[CYCLE]`, plus a `[NG]` warning) and stored like a reading. A non-zero result code means NG (for example 3232 "External signal stopped", 3229 "Finished mid-operation"). |
+| 3 | Press powered off and on | The port stays open and the reader reports `[LINK] state=no_response` after 3 failed polls. When the press answers again it reports `state=up` and asks for cycle results again (`Q1`), because a restarted press forgets that. No manual Start. |
+| 4 | The PC (MIC-770 or this laptop) is powered off or rebooted | `deploy/install_autostart.ps1` (Windows scheduled task) or `deploy/janome-panel.service` (Linux systemd) starts the panel at boot and restarts it if it exits. On start the panel resumes the reader if a run was active when it went down, or if "Start reading automatically" is ticked. Unsent data is in the disk spool. An automatic start does not give up when the database is not reachable yet: it spools and sends later. |
+| 4b | The reader process itself dies while the panel is up | The panel notices within 5 s and starts it again (same run, the log is appended to). Exception: if the reader refused to start because the database was unreachable on a manual Start, it is not retried and the error stays on screen. |
+| 5 | InfluxDB fills up | InfluxDB deletes old data by itself according to the bucket's retention. Set `influx_retention_days` (Settings: "Keep data for") and the panel applies it to the bucket when ingestion starts (the token must be allowed to edit buckets; otherwise a warning is logged and it can be set in the InfluxDB UI). If InfluxDB rejects writes because its disk is full, the data waits in the edge spool like any other outage. |
+| 6 | Network down | Data is kept at the edge (memory, then the disk spool) and sent to InfluxDB when it is reachable again, oldest first, with the time it was read. Writes are idempotent in InfluxDB, so a batch sent twice does not create duplicates. |
+| 7 | Data for each stamping | One record per press stroke (`janome_jp4_telemetry_cycles` measurement or table): OK/NG, result code and text, program number, work time, preparation time, contact and end position/load, running OK/fault/lifetime counters, sensor fault location. |
+
+Details worth knowing:
+
+- Cycle times are the moment the panel received the result (within about 0.2 s of it
+  arriving), not a clock inside the press. Results the press had queued before the
+  panel asked for them (right after a start or reconnect) have `backlog = true`;
+  their time is the time they were received, not when the stroke happened.
+- Everything above is checked by `tests/test_fail_cases.py` against a fake press and
+  a fake InfluxDB (`python -m unittest discover -s tests -v`). It has **not** yet been
+  run against the real press or a real InfluxDB, and the auto-start scripts have not
+  been tried through a real reboot.
+- To confirm on site: that an emergency stop really produces a `V1` frame (if the
+  press stays silent on an emergency stop, no NG row can be created for it), and which
+  result codes the press uses.
+
 ## Database behaviour
 
 The database engine is chosen in the panel (`database.db_type` in `config.json`):
@@ -114,7 +143,24 @@ The database engine is chosen in the panel (`database.db_type` in `config.json`)
   - The `[STATS]` line reports `db_state` (`connected`/`down`/`none`),
     `db_pending` (memory + spool) and `db_dropped`; `written` counts rows
     actually committed.
-- The tables are created as plain tables. A TimescaleDB hypertable is not
+- **`influxdb`:** same connection check, buffering and spool as above. Two
+  measurements are written: telemetry (`influx_measurement`, default
+  `janome_jp4_telemetry`; fields `encoder_position_mm`, `teaching_position_mm`,
+  `load_n`) and cycles (`influx_cycle_measurement`, default
+  `janome_jp4_telemetry_cycles`; tags `result` = `OK`/`NG` and `program`, fields as
+  listed under case 7). Timestamps are written in nanoseconds. Keys in `database`:
+  - `influx_url` (for example `http://192.168.1.10:8086`)
+  - `influx_version`: `2` (default; also works with InfluxDB 3's v2-compatible write
+    API) or `1`
+  - version 2: `influx_token`, `influx_org`, `influx_bucket`
+  - version 1: `influx_bucket` (the database name), `influx_user`, `influx_password`;
+    the database is created if it does not exist
+  - `influx_retention_days` (0 or absent leaves InfluxDB's own setting alone)
+  - The connection check at start reports an unreachable server, wrong
+    credentials or a missing bucket. A point InfluxDB rejects as malformed (HTTP
+    400/422) is logged and dropped so it cannot block the rest of the queue.
+- SQL databases get a second table, `<table_name>_cycles` (`cycles_table` to
+  rename). The tables are created as plain tables. A TimescaleDB hypertable is not
   created automatically.
 
 ## Run summary (temporary data of a run)

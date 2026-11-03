@@ -55,8 +55,9 @@ class RunSummary:
 
     SIGNALS = ("encoder_position_mm", "teaching_position_mm", "load_n")
 
-    def __init__(self, max_samples=50000):
+    def __init__(self, max_samples=50000, max_cycles=2000):
         self.max_samples = max_samples
+        self.max_cycles = max_cycles
         self._lock = threading.Lock()
         self._clear(None)
 
@@ -67,12 +68,21 @@ class RunSummary:
         self.count = 0
         self._samples = deque(maxlen=self.max_samples)
         self._acc = {name: _Accumulator() for name in self.SIGNALS}
+        self._cycles = deque(maxlen=self.max_cycles)
+        self.cycle_ok = 0
+        self.cycle_ng = 0
 
     def start(self, mode=None, when=None):
         """Begins a new run and discards the previous one."""
         with self._lock:
             self._clear(mode)
             self.started_at = when or datetime.now(timezone.utc)
+
+    def resume(self):
+        """Continues the same run after the reader was restarted automatically."""
+        with self._lock:
+            if self.started_at is not None:
+                self.ended_at = None
 
     def finish(self, when=None):
         """Marks the run as ended; the data stays available until the next start()."""
@@ -91,6 +101,27 @@ class RunSummary:
             self._samples.append((when, encoder, teaching, load))
             for name, value in zip(self.SIGNALS, (encoder, teaching, load)):
                 self._acc[name].add(value)
+
+    def add_cycle(self, when, cycle):
+        """Records one finished press cycle (a dict with at least 'ok')."""
+        with self._lock:
+            if self.ended_at is not None:
+                return
+            if self.started_at is None:
+                self.started_at = when
+            if cycle.get("ok"):
+                self.cycle_ok += 1
+            else:
+                self.cycle_ng += 1
+            self._cycles.append(dict(cycle, time=when.isoformat()))
+
+    def cycles(self, limit=None):
+        """Finished cycles of the run, oldest first; the latest `limit` if given."""
+        with self._lock:
+            rows = list(self._cycles)
+        if limit is not None and limit >= 0:
+            rows = rows[-limit:] if limit else []
+        return rows
 
     def snapshot(self):
         """Small dict describing the run and its statistics (no samples)."""
@@ -113,6 +144,7 @@ class RunSummary:
                 "stored": len(self._samples),
                 "truncated": self.count > len(self._samples),
                 "stats": {name: self._acc[name].as_dict() for name in self.SIGNALS},
+                "cycles": {"total": self.cycle_ok + self.cycle_ng, "ok": self.cycle_ok, "ng": self.cycle_ng},
             }
 
     def samples(self, limit=None):

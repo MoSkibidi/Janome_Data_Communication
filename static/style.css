@@ -266,6 +266,11 @@ input:focus-visible, select:focus-visible, summary:focus-visible {
 .badge-idle { background: var(--surface-alt); color: var(--muted); }
 .badge-running { background: var(--ok-bg); border-color: #b9dcc5; color: var(--ok); }
 .badge-sim { background: var(--warn-bg); border-color: #ecd9a0; color: var(--warn); }
+.badge-ok { background: var(--ok-bg); border-color: #b9dcc5; color: var(--ok); }
+.badge-ng { background: var(--danger-bg); border-color: #efc2be; color: var(--danger); }
+.cycle-badges { display: inline-flex; gap: 8px; }
+.cycles-table tr.cycle-ng td { background: var(--danger-bg); color: var(--danger); font-weight: 600; }
+.cycles-table td:nth-child(2) { font-family: var(--font); }
 .badge-finished { background: var(--surface-alt); border-color: var(--border-strong); color: var(--text); }
 
 .run-meta { font-size: 0.9375rem; color: var(--muted); margin-bottom: 12px; }

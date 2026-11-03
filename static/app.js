@@ -36,6 +36,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const sqlitePathInput = document.getElementById('SQLITE_PATH');
 
+    const influxFields = {
+        url: document.getElementById('INFLUX_URL'),
+        version: document.getElementById('INFLUX_VERSION'),
+        token: document.getElementById('INFLUX_TOKEN'),
+        org: document.getElementById('INFLUX_ORG'),
+        bucket: document.getElementById('INFLUX_BUCKET'),
+        user: document.getElementById('INFLUX_USER'),
+        password: document.getElementById('INFLUX_PASSWORD'),
+        measurement: document.getElementById('INFLUX_MEASUREMENT'),
+        retention: document.getElementById('INFLUX_RETENTION_DAYS')
+    };
+    const influxGroup = document.getElementById('influx-config-group');
+
     const postgresGroup = document.getElementById('postgres-config-group');
     const sqliteGroup = document.getElementById('sqlite-config-group');
 
@@ -62,18 +75,39 @@ document.addEventListener('DOMContentLoaded', () => {
     // Toggle Postgres vs SQLite Form Fields
     function updateDbFieldsVisibility() {
         const val = dbTypeSelect.value;
-        if (val === 'none') {
-            if (postgresGroup) postgresGroup.style.display = 'none';
-            if (sqliteGroup) sqliteGroup.style.display = 'none';
-        } else if (val === 'postgresql') {
-            if (postgresGroup) postgresGroup.style.display = 'block';
-            if (sqliteGroup) sqliteGroup.style.display = 'none';
-        } else {
-            if (postgresGroup) postgresGroup.style.display = 'none';
-            if (sqliteGroup) sqliteGroup.style.display = 'block';
-        }
+        postgresGroup.style.display = val === 'postgresql' ? 'block' : 'none';
+        sqliteGroup.style.display = val === 'sqlite' ? 'block' : 'none';
+        influxGroup.style.display = val === 'influxdb' ? 'block' : 'none';
+        // InfluxDB 1.x logs in with user/password; 2.x and 3.x use a token and an organization
+        const v1 = influxFields.version.value === '1';
+        influxGroup.querySelectorAll('.influx-v1').forEach(el => { el.style.display = v1 ? '' : 'none'; });
+        influxGroup.querySelectorAll('.influx-v2').forEach(el => { el.style.display = v1 ? 'none' : ''; });
     }
     dbTypeSelect.addEventListener('change', updateDbFieldsVisibility);
+    influxFields.version.addEventListener('change', updateDbFieldsVisibility);
+
+    // Database part of the settings, as the form shows it (used by Save and by Test connection)
+    function collectDbConfig() {
+        return {
+            db_type: dbTypeSelect.value,
+            db_name: dbNameInput.value.trim(),
+            table_name: dbTableInput.value.trim() || 'janome_jp4_telemetry',
+            host: dbHostInput.value.trim(),
+            port: parseInt(dbPortInput.value, 10),
+            user: dbUserInput.value.trim(),
+            password: dbPasswordInput.value.trim(),
+            sqlite_path: sqlitePathInput.value.trim(),
+            influx_url: influxFields.url.value.trim(),
+            influx_version: influxFields.version.value,
+            influx_token: influxFields.token.value.trim(),
+            influx_org: influxFields.org.value.trim(),
+            influx_bucket: influxFields.bucket.value.trim(),
+            influx_user: influxFields.user.value.trim(),
+            influx_password: influxFields.password.value,
+            influx_measurement: influxFields.measurement.value.trim(),
+            influx_retention_days: parseInt(influxFields.retention.value, 10) || 0
+        };
+    }
 
     // Load Configuration from API
     async function loadConfig() {
@@ -99,6 +133,15 @@ document.addEventListener('DOMContentLoaded', () => {
             if (dbPasswordInput) dbPasswordInput.value = db.password || 'admin';
             if (dbTableInput) dbTableInput.value = db.table_name || 'janome_jp4_telemetry';
             if (sqlitePathInput) sqlitePathInput.value = db.sqlite_path || 'janome_jp4_data.db';
+            influxFields.url.value = db.influx_url || '';
+            influxFields.version.value = String(db.influx_version || '2').startsWith('1') ? '1' : '2';
+            influxFields.token.value = db.influx_token || '';
+            influxFields.org.value = db.influx_org || '';
+            influxFields.bucket.value = db.influx_bucket || db.influx_database || '';
+            influxFields.user.value = db.influx_user || '';
+            influxFields.password.value = db.influx_password || '';
+            influxFields.measurement.value = db.influx_measurement || '';
+            influxFields.retention.value = db.influx_retention_days || 0;
 
             const startup = data.startup || {};
             const autoStartCheck = document.getElementById('AUTO_START_ON_STARTUP');
@@ -130,17 +173,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 baudrate: parseInt(serialBaudrate.value, 10),
                 timeout: parseFloat(serialTimeout.value)
             },
-            database: {
-                db_type: dbTypeSelect.value,
-                db_name: dbNameInput ? dbNameInput.value.trim() : 'janome_jp4_data',
-                table_name: dbTableInput ? dbTableInput.value.trim() : 'janome_jp4_telemetry',
-                host: dbHostInput ? dbHostInput.value.trim() : 'localhost',
-                port: dbPortInput ? parseInt(dbPortInput.value, 10) : 5432,
-                user: dbUserInput ? dbUserInput.value.trim() : 'admin',
-                password: dbPasswordInput ? dbPasswordInput.value.trim() : 'admin',
-                sqlite_path: sqlitePathInput ? sqlitePathInput.value.trim() : 'janome_jp4_data.db',
+            database: Object.assign(collectDbConfig(), {
                 description: "Database storage for JANOME Electro Press JP4 telemetry data"
-            },
+            }),
             acquisition: {
                 interval_time: parseFloat(acqInterval.value)
             }
@@ -235,17 +270,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Test Database Connection
     btnTestDb.addEventListener('click', async () => {
-        const payload = {
-            database: {
-                db_type: dbTypeSelect.value,
-                db_name: dbNameInput ? dbNameInput.value.trim() : 'janome_jp4_data',
-                host: dbHostInput ? dbHostInput.value.trim() : 'localhost',
-                port: dbPortInput ? parseInt(dbPortInput.value, 10) : 5432,
-                user: dbUserInput ? dbUserInput.value.trim() : 'admin',
-                password: dbPasswordInput ? dbPasswordInput.value.trim() : 'admin',
-                sqlite_path: sqlitePathInput ? sqlitePathInput.value.trim() : 'janome_jp4_data.db'
-            }
-        };
+        const payload = { database: collectDbConfig() };
         try {
             appendLog('[SYSTEM] Testing database connectivity...');
             const res = await fetch('/api/test_db', {
@@ -402,6 +427,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         elSamplesCount.textContent = run.count ? `(${run.count.toLocaleString()})` : '';
+        if (run.cycles) showCycleTotals(run.cycles);
 
         // Refresh the sample table once when a run ends so it shows the final data
         if (lastRunState === 'running' && run.state !== 'running' && elSamplesDetails.open) {
@@ -439,6 +465,70 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (err) {
             elSamplesNote.textContent = `Could not load readings: ${err.message}`;
+        }
+    }
+
+    // ---------- Press link (is the press answering?) ----------
+    const elLink = document.getElementById('link-state');
+    const LINK_TEXT = {
+        up: ['Connected', 'db-ok'],
+        no_response: ['Not answering - retrying', 'db-down'],
+        port_unavailable: ['Serial port unavailable - retrying', 'db-down'],
+        connecting: ['Connecting...', 'db-none'],
+        idle: ['Not running', 'db-none']
+    };
+
+    function showLink(link) {
+        const [text, cls] = LINK_TEXT[link.state] || [link.state, 'db-none'];
+        elLink.textContent = text;
+        elLink.className = `db-state ${cls}`;
+        elLink.title = link.detail || '';
+    }
+
+    // ---------- Finished press cycles (OK / NG) ----------
+    const elCyclesBody = document.getElementById('cycles-body');
+    const elCyclesNote = document.getElementById('cycles-note');
+    const elCyclesOk = document.getElementById('cycles-ok');
+    const elCyclesNg = document.getElementById('cycles-ng');
+    const MAX_CYCLE_ROWS = 200;
+
+    function cycleRow(c) {
+        const tr = document.createElement('tr');
+        if (!c.ok) tr.className = 'cycle-ng';
+        const result = c.ok ? 'OK' : `NG - ${c.result_text}`;
+        [formatClock(c.time), result, c.end_position_mm.toFixed(4), c.end_load_n.toFixed(1), c.work_time_s.toFixed(2)].forEach(text => {
+            const td = document.createElement('td');
+            td.textContent = text;
+            tr.appendChild(td);
+        });
+        return tr;
+    }
+
+    function addCycleRow(cycle) {
+        elCyclesBody.insertBefore(cycleRow(cycle), elCyclesBody.firstChild);
+        while (elCyclesBody.childElementCount > MAX_CYCLE_ROWS) elCyclesBody.removeChild(elCyclesBody.lastChild);
+        elCyclesNote.textContent = `Showing the latest ${elCyclesBody.childElementCount} cycle(s), newest first.`;
+    }
+
+    function showCycleTotals(totals) {
+        elCyclesOk.textContent = `OK ${totals.ok}`;
+        elCyclesNg.textContent = `NG ${totals.ng}`;
+        if (!totals.total) {
+            elCyclesBody.innerHTML = '';
+            elCyclesNote.textContent = 'No cycles yet.';
+        }
+    }
+
+    async function loadCycles() {
+        try {
+            const res = await fetch('/api/cycles?limit=' + MAX_CYCLE_ROWS);
+            const data = await res.json();
+            elCyclesBody.innerHTML = '';
+            data.cycles.forEach(c => elCyclesBody.insertBefore(cycleRow(c), elCyclesBody.firstChild));
+            showCycleTotals(data.totals);
+            if (data.cycles.length) elCyclesNote.textContent = `Showing the latest ${data.cycles.length} cycle(s), newest first.`;
+        } catch (err) {
+            elCyclesNote.textContent = `Could not load cycles: ${err.message}`;
         }
     }
 
@@ -488,6 +578,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     socket.on('run_update', renderRun);
+    socket.on('link_update', showLink);
+    socket.on('cycle_update', addCycleRow);
 
     socket.on('log_update', (data) => {
         if (data && data.log) {
@@ -497,4 +589,5 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Initial config load
     loadConfig();
+    loadCycles();
 });

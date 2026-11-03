@@ -4,10 +4,45 @@ import os
 import logging
 import json
 import threading
+import re
 import time
+import base64
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 
 logger = logging.getLogger(__name__)
+
+# Per-cycle ("quality data") record: one row per press stroke, OK or NG.
+# (column name, kind) - kind decides the SQL type; InfluxDB uses the same names as fields.
+CYCLE_FIELDS = (
+    ("program_number", "int"), ("ok", "bool"), ("result_code", "int"), ("result_text", "str"),
+    ("prep_time_s", "float"), ("work_time_s", "float"),
+    ("contact_position_mm", "float"), ("contact_load_n", "float"),
+    ("end_position_mm", "float"), ("end_load_n", "float"),
+    ("ok_total", "int"), ("fault_total", "int"), ("lifetime_total", "int"),
+    ("sensor_fault_section", "int"), ("sensor_fault_number", "int"),
+    ("backlog", "bool"),
+)
+_SQL_TYPES = {
+    "sqlite": {"int": "INTEGER", "bool": "INTEGER", "str": "TEXT", "float": "REAL"},
+    "postgresql": {"int": "INTEGER", "bool": "BOOLEAN", "str": "TEXT", "float": "DOUBLE PRECISION"},
+    "mysql": {"int": "INT", "bool": "BOOLEAN", "str": "TEXT", "float": "DOUBLE"},
+}
+
+
+def _ts_ns(timestamp):
+    """UTC datetime -> integer nanoseconds since the epoch (exact, no float rounding)."""
+    if timestamp is None:
+        return time.time_ns()
+    return int(timestamp.timestamp()) * 10**9 + timestamp.microsecond * 1000
+
+
+def _lp_escape(text):
+    """Escapes a measurement name or tag value for InfluxDB line protocol."""
+    return str(text).replace("\\", "\\\\").replace(",", "\\,").replace(" ", "\\ ").replace("=", "\\=")
+
 
 class DatabaseHandler:
     def __init__(self, db_config, connect=True):
@@ -22,6 +57,7 @@ class DatabaseHandler:
         self.db_type = db_config.get("db_type", "sqlite").lower()
         self.db_name = db_config.get("db_name", "janome_jp4_data.db")
         self.table_name = db_config.get("table_name", "janome_jp4_telemetry")
+        self.cycles_table = db_config.get("cycles_table") or f"{self.table_name}_cycles"
         self.description = db_config.get("description", "JANOME Electro Press JP4 Telemetry DB")
 
         self.conn = None
@@ -107,17 +143,33 @@ class DatabaseHandler:
             except ImportError:
                 raise ImportError("mysql-connector-python package is required for MySQL connections.")
         elif self.db_type == "influxdb":
-            logger.info("Configured InfluxDB destination.")
             self.conn = None
+            self.influx_check()
         else:
             raise ValueError(f"Unsupported database type: {self.db_type}")
 
     def init_db(self):
-        """Creates the target table if it does not already exist."""
+        """Creates the target tables (telemetry and per-cycle results) if they do not already exist."""
         if self.db_type == "influxdb":
             return
 
         cursor = self.conn.cursor()
+        sql_kind = "postgresql" if self.db_type in ("postgres", "postgresql", "timescaledb") else self.db_type
+        types = _SQL_TYPES[sql_kind]
+        id_col = {
+            "sqlite": "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            "postgresql": "id SERIAL PRIMARY KEY",
+            "mysql": "id INT AUTO_INCREMENT PRIMARY KEY",
+        }[sql_kind]
+        ts_type = {"sqlite": "TEXT", "postgresql": "TIMESTAMP WITH TIME ZONE", "mysql": "DATETIME"}[sql_kind]
+        cycle_cols = ",\n                ".join(f"{name} {types[kind]}" for name, kind in CYCLE_FIELDS)
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.cycles_table} (
+                {id_col},
+                timestamp {ts_type} NOT NULL,
+                {cycle_cols}
+            );
+            """)
 
         if self.db_type == "sqlite":
             query = f"""
@@ -179,12 +231,14 @@ class DatabaseHandler:
         if not records:
             return
         if self.db_type == "influxdb":
-            for timestamp, data in records:
-                self._insert_influx(data, timestamp)
+            self._influx_write([self._influx_line(data, timestamp) for timestamp, data in records])
             return
         try:
             for timestamp, data in records:
-                self.insert_telemetry(data, timestamp=timestamp, commit=False)
+                if data.get("_kind") == "cycle":
+                    self.insert_cycle(data, timestamp=timestamp, commit=False)
+                else:
+                    self.insert_telemetry(data, timestamp=timestamp, commit=False)
             self.conn.commit()
         except Exception:
             try:
@@ -205,7 +259,8 @@ class DatabaseHandler:
         :return: Inserted record ID or boolean success
         """
         if self.db_type == "influxdb":
-            return self._insert_influx(data, timestamp)
+            self._influx_write([self._influx_line(data, timestamp)])
+            return True
 
         now_dt = timestamp or datetime.datetime.now(datetime.timezone.utc)
         if self.db_type == "sqlite":
@@ -261,37 +316,210 @@ class DatabaseHandler:
                 pass
             raise
 
-    def _insert_influx(self, data, timestamp=None):
-        import time
-        import urllib.request
-        import urllib.parse
-        url = self.config.get("influx_url", "http://localhost:8086").rstrip('/')
-        token = self.config.get("influx_token", "")
-        org = self.config.get("influx_org", "mddp")
-        bucket = self.config.get("influx_bucket", "janome_jp4_telemetry")
-        measurement = self.config.get("influx_measurement", self.table_name)
+    def insert_cycle(self, data, timestamp=None, commit=True):
+        """Inserts one per-cycle result row (SQL back ends; InfluxDB goes through insert_many)."""
+        now_dt = timestamp or datetime.datetime.now(datetime.timezone.utc)
+        db_timestamp = now_dt.isoformat(" ") if self.db_type == "sqlite" else now_dt
+        placeholder = "?" if self.db_type == "sqlite" else "%s"
+        columns = ["timestamp"] + [name for name, _ in CYCLE_FIELDS]
+        query = (f"INSERT INTO {self.cycles_table} ({', '.join(columns)}) "
+                 f"VALUES ({', '.join([placeholder] * len(columns))});")
+        params = [db_timestamp] + [data.get(name) for name, _ in CYCLE_FIELDS]
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            if commit:
+                self.conn.commit()
+            cursor.close()
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            raise
 
-        write_url = f"{url}/api/v2/write?org={urllib.parse.quote(org)}&bucket={urllib.parse.quote(bucket)}&precision=s"
+    # ------------------------------------------------------------------
+    # InfluxDB (v2 token/org/bucket, or v1 database + optional user/password).
+    # Samples carry the time they were read, so a replay after an outage keeps
+    # the original timestamps; identical series+timestamp simply overwrite in
+    # InfluxDB, so re-sending a batch after a crash does not create duplicates.
+    # ------------------------------------------------------------------
+
+    def _influx_url(self):
+        return (self.config.get("influx_url") or "http://localhost:8086").rstrip("/")
+
+    def _influx_v1(self):
+        return str(self.config.get("influx_version") or "2").startswith("1")
+
+    def _influx_target(self):
+        """Bucket (v2) or database (v1) name."""
+        return self.config.get("influx_bucket") or self.config.get("influx_database") or "janome_jp4"
+
+    def _influx_headers(self, content_type="text/plain; charset=utf-8"):
+        headers = {"Content-Type": content_type, "Accept": "application/json"}
+        if self._influx_v1():
+            user = self.config.get("influx_user") or ""
+            if user:
+                raw = f"{user}:{self.config.get('influx_password') or ''}".encode("utf-8")
+                headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+        elif self.config.get("influx_token"):
+            headers["Authorization"] = f"Token {self.config['influx_token']}"
+        return headers
+
+    def _influx_request(self, method, path, body=None, content_type="text/plain; charset=utf-8", timeout=5.0):
+        """Returns (http_status, body_text) for any HTTP answer; raises only when the server cannot be reached."""
+        req = urllib.request.Request(self._influx_url() + path, data=body,
+                                     headers=self._influx_headers(content_type), method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as err:
+            return err.code, err.read().decode("utf-8", "replace")
+
+    def _influx_write_path(self):
+        target = urllib.parse.quote(self._influx_target())
+        if self._influx_v1():
+            return f"/write?db={target}&precision=ns"
+        org = urllib.parse.quote(self.config.get("influx_org") or "")
+        return f"/api/v2/write?org={org}&bucket={target}&precision=ns"
+
+    def _influx_line(self, data, timestamp):
+        """One line-protocol line for a telemetry sample or a per-cycle result."""
+        ts = _ts_ns(timestamp)
+        if data.get("_kind") == "cycle":
+            measurement = self.config.get("influx_cycle_measurement") or self.cycles_table
+            tags = f"{_lp_escape(measurement)},result={'OK' if data.get('ok') else 'NG'}"
+            if data.get("program_number") is not None:
+                tags += f",program={int(data['program_number'])}"
+            fields = []
+            for name, kind in CYCLE_FIELDS:
+                value = data.get(name)
+                if value is None:
+                    continue
+                if kind == "int":
+                    fields.append(f"{name}={int(value)}i")
+                elif kind == "bool":
+                    fields.append(f"{name}={'true' if value else 'false'}")
+                elif kind == "str":
+                    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+                    fields.append(f'{name}="{escaped}"')
+                else:
+                    fields.append(f"{name}={float(value)!r}")
+            return f"{tags} {','.join(fields)} {ts}"
+        measurement = self.config.get("influx_measurement") or self.table_name
         fields = [
-            f"encoder_position_mm={float(data.get('encoder_position_mm', 0.0))}",
-            f"teaching_position_mm={float(data.get('teaching_position_mm', 0.0))}",
-            f"load_n={float(data.get('load_n', 0.0))}",
+            f"encoder_position_mm={float(data.get('encoder_position_mm', 0.0))!r}",
+            f"teaching_position_mm={float(data.get('teaching_position_mm', 0.0))!r}",
+            f"load_n={float(data.get('load_n', 0.0))!r}",
         ]
-        ts_sec = int(timestamp.timestamp()) if timestamp else int(time.time())
-        line_protocol = f"{measurement} {','.join(fields)} {ts_sec}"
+        return f"{_lp_escape(measurement)} {','.join(fields)} {ts}"
 
-        headers = {
-            "Content-Type": "text/plain; charset=utf-8",
-            "Accept": "application/json"
-        }
-        if token:
-            headers["Authorization"] = f"Token {token}"
+    @staticmethod
+    def _influx_message(body):
+        try:
+            parsed = json.loads(body)
+            return parsed.get("message") or parsed.get("error") or body[:200]
+        except Exception:
+            return (body or "").strip()[:200]
 
-        req = urllib.request.Request(write_url, data=line_protocol.encode('utf-8'), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=3.0) as resp:
-            if resp.status not in (200, 204):
-                raise Exception(f"InfluxDB HTTP status {resp.status}")
-        return True
+    def _influx_write(self, lines):
+        """
+        Sends lines in one request. An unreachable server, bad credentials, a missing bucket
+        or a server error raises (the caller keeps the data and retries). A line the server
+        rejects as malformed (HTTP 400/422) is logged and dropped so one bad point can never
+        block everything queued behind it.
+        """
+        if not lines:
+            return
+        ok = (200, 204)
+        status, body = self._influx_request("POST", self._influx_write_path(), "\n".join(lines).encode("utf-8"))
+        if status in ok:
+            return
+        if status in (400, 422):
+            if len(lines) > 1:
+                for line in lines:
+                    self._influx_write([line])
+                return
+            logger.error(f"[DB] InfluxDB rejected a sample (HTTP {status}: {self._influx_message(body)}); dropped: {lines[0][:120]}")
+            return
+        raise Exception(f"InfluxDB HTTP {status}: {self._influx_message(body)}")
+
+    def influx_check(self):
+        """Raises with a clear message if InfluxDB is unreachable or rejects the credentials/bucket."""
+        url = self._influx_url()
+        target = self._influx_target()
+        v1 = self._influx_v1()
+        try:
+            status, body = self._influx_request("GET", "/ping" if v1 else "/health", timeout=4.0)
+        except Exception as err:
+            raise Exception(f"cannot reach InfluxDB at {url}: {err}")
+        if status not in (200, 204):
+            raise Exception(f"InfluxDB at {url} answered HTTP {status} to the health check")
+
+        # An empty write checks the credentials and the bucket/database without storing anything
+        status, body = self._influx_request("POST", self._influx_write_path(), b"")
+        if status == 404 and v1:
+            create = urllib.parse.urlencode({"q": f'CREATE DATABASE "{target}"'}).encode()
+            c_status, c_body = self._influx_request("POST", "/query", create, "application/x-www-form-urlencoded")
+            if c_status != 200:
+                raise Exception(f"InfluxDB database '{target}' does not exist and could not be created (HTTP {c_status}: {self._influx_message(c_body)})")
+            logger.info(f"InfluxDB database '{target}' created.")
+        elif status in (401, 403):
+            raise Exception(f"InfluxDB rejected the credentials (HTTP {status}): {self._influx_message(body)}")
+        elif status == 404:
+            raise Exception(f"InfluxDB bucket '{target}' (org '{self.config.get('influx_org')}') was not found: {self._influx_message(body)}")
+        logger.info(f"Connected to InfluxDB at {url} ({'v1 database' if v1 else 'v2 bucket'} '{target}').")
+
+        try:
+            self._influx_apply_retention()
+        except Exception as err:
+            logger.warning(f"[DB] Could not apply the InfluxDB retention setting: {err}")
+
+    def _influx_apply_retention(self):
+        """
+        Sets how long InfluxDB keeps data (database config key influx_retention_days; 0 or
+        empty leaves the server's setting alone). InfluxDB deletes older data by itself, which
+        is what stops the disk from filling up. Needs a token/user allowed to edit the bucket.
+        """
+        days = int(self.config.get("influx_retention_days") or 0)
+        if days <= 0:
+            return
+        target = self._influx_target()
+        if self._influx_v1():
+            q = urllib.parse.urlencode({"q": f'SHOW RETENTION POLICIES ON "{target}"'})
+            status, body = self._influx_request("GET", f"/query?{q}")
+            if status != 200:
+                raise Exception(f"HTTP {status}: {self._influx_message(body)}")
+            series = json.loads(body)["results"][0].get("series") or []
+            rows = series[0]["values"] if series else []
+            policy = next((r for r in rows if r[4]), rows[0] if rows else None)
+            if policy is None:
+                return
+            seconds = sum(int(n) * {"h": 3600, "m": 60, "s": 1}[u] for n, u in re.findall(r"(\d+)([hms])", policy[1]))
+            if seconds != days * 86400:
+                alter = urllib.parse.urlencode({"q": f'ALTER RETENTION POLICY "{policy[0]}" ON "{target}" DURATION {days}d'}).encode()
+                a_status, a_body = self._influx_request("POST", "/query", alter, "application/x-www-form-urlencoded")
+                if a_status != 200:
+                    raise Exception(f"HTTP {a_status}: {self._influx_message(a_body)}")
+                logger.info(f"[DB] InfluxDB retention of '{target}' set to {days} day(s).")
+            return
+
+        q = urllib.parse.urlencode({"name": target, "org": self.config.get("influx_org") or ""})
+        status, body = self._influx_request("GET", f"/api/v2/buckets?{q}")
+        if status != 200:
+            raise Exception(f"HTTP {status}: {self._influx_message(body)} (the token needs permission to read/edit buckets; retention can also be set in the InfluxDB UI)")
+        buckets = json.loads(body).get("buckets") or []
+        if not buckets:
+            return
+        bucket = buckets[0]
+        rules = bucket.get("retentionRules") or []
+        if rules and rules[0].get("everySeconds") == days * 86400:
+            return
+        patch = json.dumps({"retentionRules": [{"type": "expire", "everySeconds": days * 86400}]}).encode()
+        p_status, p_body = self._influx_request("PATCH", f"/api/v2/buckets/{bucket['id']}", patch, "application/json")
+        if p_status != 200:
+            raise Exception(f"HTTP {p_status}: {self._influx_message(p_body)}")
+        logger.info(f"[DB] InfluxDB retention of bucket '{target}' set to {days} day(s).")
 
     def close(self):
         """Closes the database connection cleanly."""

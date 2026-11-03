@@ -46,6 +46,10 @@
                 </div>
                 <dl class="facts">
                     <div class="fact">
+                        <dt>Press</dt>
+                        <dd id="link-state" class="db-state db-none">Not running</dd>
+                    </div>
+                    <div class="fact">
                         <dt>Readings taken</dt>
                         <dd id="telemetry-polled">0</dd>
                     </div>
@@ -111,6 +115,27 @@
                 </details>
             </section>
 
+            <!-- Finished press cycles: one row per stroke, OK or NG -->
+            <section class="card" aria-labelledby="cycles-title">
+                <div class="card-head">
+                    <h2 id="cycles-title">Press cycles</h2>
+                    <span class="cycle-badges">
+                        <span class="badge badge-ok" id="cycles-ok">OK 0</span>
+                        <span class="badge badge-ng" id="cycles-ng">NG 0</span>
+                    </span>
+                </div>
+                <p class="run-meta">One row for every stroke the press finishes, with its result. NG rows are stored in the database like the OK ones.</p>
+                <div class="table-wrap samples-scroll">
+                    <table class="data-table cycles-table">
+                        <thead>
+                            <tr><th scope="col">Time</th><th scope="col">Result</th><th scope="col">End position (mm)</th><th scope="col">End load (N)</th><th scope="col">Work time (s)</th></tr>
+                        </thead>
+                        <tbody id="cycles-body"></tbody>
+                    </table>
+                </div>
+                <p class="note" id="cycles-note">No cycles yet.</p>
+            </section>
+
             <!-- Log -->
             <section class="card log-card" aria-labelledby="log-title">
                 <div class="log-header">
@@ -171,6 +196,7 @@
                                 <option value="none">Nowhere (show in log only)</option>
                                 <option value="sqlite">SQLite file</option>
                                 <option value="postgresql">PostgreSQL / TimescaleDB</option>
+                                <option value="influxdb">InfluxDB</option>
                             </select>
                         </div>
 
@@ -202,6 +228,50 @@
                                     <label for="DB_PASSWORD">Password</label>
                                     <input type="password" id="DB_PASSWORD" name="DB_PASSWORD" placeholder="admin">
                                 </div>
+                            </div>
+                        </div>
+
+                        <div id="influx-config-group" class="db-group" style="display: none;">
+                            <div class="field">
+                                <label for="INFLUX_URL">InfluxDB address</label>
+                                <input type="text" id="INFLUX_URL" name="INFLUX_URL" placeholder="http://192.168.1.10:8086">
+                            </div>
+                            <div class="field">
+                                <label for="INFLUX_VERSION">InfluxDB version</label>
+                                <select id="INFLUX_VERSION" name="INFLUX_VERSION">
+                                    <option value="2">2.x or 3.x (token, organization, bucket)</option>
+                                    <option value="1">1.x (database, user, password)</option>
+                                </select>
+                            </div>
+                            <div class="field influx-v2">
+                                <label for="INFLUX_TOKEN">Token</label>
+                                <input type="password" id="INFLUX_TOKEN" name="INFLUX_TOKEN" autocomplete="off">
+                            </div>
+                            <div class="field influx-v2">
+                                <label for="INFLUX_ORG">Organization</label>
+                                <input type="text" id="INFLUX_ORG" name="INFLUX_ORG">
+                            </div>
+                            <div class="field">
+                                <label for="INFLUX_BUCKET">Bucket / database</label>
+                                <input type="text" id="INFLUX_BUCKET" name="INFLUX_BUCKET" placeholder="janome_jp4">
+                            </div>
+                            <div class="field-row influx-v1">
+                                <div class="field">
+                                    <label for="INFLUX_USER">User</label>
+                                    <input type="text" id="INFLUX_USER" name="INFLUX_USER" autocomplete="off">
+                                </div>
+                                <div class="field">
+                                    <label for="INFLUX_PASSWORD">Password</label>
+                                    <input type="password" id="INFLUX_PASSWORD" name="INFLUX_PASSWORD" autocomplete="off">
+                                </div>
+                            </div>
+                            <div class="field">
+                                <label for="INFLUX_MEASUREMENT">Measurement name</label>
+                                <input type="text" id="INFLUX_MEASUREMENT" name="INFLUX_MEASUREMENT" placeholder="janome_jp4_telemetry">
+                            </div>
+                            <div class="field">
+                                <label for="INFLUX_RETENTION_DAYS">Keep data for (days, 0 = leave as set in InfluxDB)</label>
+                                <input type="number" id="INFLUX_RETENTION_DAYS" name="INFLUX_RETENTION_DAYS" min="0" step="1" value="0">
                             </div>
                         </div>
 

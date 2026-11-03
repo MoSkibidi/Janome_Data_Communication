@@ -1,0 +1,22 @@
+# systemd unit for running the Janome JP4 panel on Linux (for example on the MIC-770).
+# Copy to /etc/systemd/system/, adjust the paths and user, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now janome-panel
+# The panel then starts at boot and is restarted if it exits; the reader resumes by itself.
+[Unit]
+Description=Janome JP4 control panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=janome
+# The user must be allowed to open the serial port
+SupplementaryGroups=dialout
+WorkingDirectory=/opt/janome
+Environment=JANOME_DATA_DIR=/var/lib/janome
+ExecStart=/opt/janome/.venv/bin/python app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

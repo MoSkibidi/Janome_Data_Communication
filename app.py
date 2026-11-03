@@ -46,6 +46,10 @@ if not os.path.exists(CONFIG_PATH) and os.path.exists(_SEED_CONFIG):
 tail_thread = None
 stop_tail_event = threading.Event()
 last_stats = {}
+last_link = {}  # latest "[LINK] state=..." report from the reader: is the press answering?
+reader_proc = None  # Popen of the reader this panel started (None after a panel restart)
+launch_lock = threading.Lock()
+SUPERVISE_EVERY_S = 5
 run_summary = RunSummary()  # statistics and samples of the current/last run, kept in memory only
 
 def read_config():
@@ -166,9 +170,30 @@ STATS_REGEX = re.compile(
     r"\[STATS\] polled=(?P<polled>[0-9,]+) \| written=(?P<written>[0-9,]+) \| db_errors=(?P<errors>[0-9]+) \| encoder_position_mm=(?P<encoder>-?[0-9\.]+) \| teaching_position_mm=(?P<teach>-?[0-9\.]+) \| load_n=(?P<load>-?[0-9\.]+)(?: \| db_state=(?P<db_state>\w+) \| db_pending=(?P<db_pending>[0-9]+) \| db_dropped=(?P<db_dropped>[0-9]+))?(?: \| time=(?P<time>\S+))?"
 )
 
+# E.g.: [LINK] state=no_response detail=Timeout waiting for response to command 'N1'. ...
+LINK_REGEX = re.compile(r"\[LINK\] state=(?P<state>\w+)(?: detail=(?P<detail>.*))?")
+# E.g.: [CYCLE] {"program_number": 1, "ok": false, "result_code": 3232, ..., "time": "2026-11-05T01:02:03.456+00:00"}
+CYCLE_REGEX = re.compile(r"\[CYCLE\] (?P<json>\{.*\})")
+
 def parse_and_emit_stats(line):
-    """Parses stats from a line and updates global caches."""
-    global last_stats
+    """Parses stats, link-state and finished-cycle lines and updates global caches."""
+    global last_stats, last_link
+    link = LINK_REGEX.search(line)
+    if link:
+        last_link = {'state': link.group('state'), 'detail': (link.group('detail') or '').strip()}
+        socketio.emit('link_update', last_link)
+        return
+    cycle_match = CYCLE_REGEX.search(line)
+    if cycle_match:
+        try:
+            cycle = json.loads(cycle_match.group('json'))
+            when = datetime.fromisoformat(cycle['time'])
+        except (ValueError, KeyError):
+            return
+        run_summary.add_cycle(when, cycle)
+        socketio.emit('cycle_update', cycle)
+        socketio.emit('run_update', run_summary.snapshot())
+        return
     match = STATS_REGEX.search(line)
     if match:
         try:
@@ -195,11 +220,12 @@ def parse_and_emit_stats(line):
         }
         socketio.emit('stats_update', last_stats)
 
-def tail_log_file(from_start=False):
+def tail_log_file(from_start=False, offset=None):
     """Background loop tailing the physical log file to feed sockets.
 
     from_start=True reads the file from its beginning; used for a run this panel just
-    started, so no early sample is missed. Otherwise only new lines are followed.
+    started, so no early sample is missed. offset starts at a given byte position (used when
+    the reader is restarted and appends to the same log). Otherwise only new lines are followed.
     """
     print("[SYSTEM] Janome JP4 Log tailing thread started.")
 
@@ -208,7 +234,10 @@ def tail_log_file(from_start=False):
 
     try:
         with open(LOG_PATH, 'r', errors='replace') as f:
-            f.seek(0, os.SEEK_SET if from_start else os.SEEK_END)
+            if offset is not None:
+                f.seek(offset)
+            else:
+                f.seek(0, os.SEEK_SET if from_start else os.SEEK_END)
 
             while not stop_tail_event.is_set():
                 # is_pid_running() shells out to tasklist on Windows, which
@@ -218,6 +247,7 @@ def tail_log_file(from_start=False):
                 pid, _ = eventlet.tpool.execute(get_running_process)
                 if pid is None:
                     socketio.emit('status_change', {'is_running': False})
+                    socketio.emit('link_update', {'state': 'idle', 'detail': ''})
                     run_summary.finish()
                     socketio.emit('run_update', run_summary.snapshot())
                     if os.path.exists(PID_PATH):
@@ -248,12 +278,12 @@ def tail_log_file(from_start=False):
     finally:
         print("[SYSTEM] Janome JP4 Log tailing thread finished.")
 
-def start_tailing(from_start=False):
+def start_tailing(from_start=False, offset=None):
     """Starts a new background tailing thread if not active."""
     global tail_thread, stop_tail_event
     stop_tail_event.clear()
     if tail_thread is None or not tail_thread.is_alive():
-        tail_thread = threading.Thread(target=tail_log_file, args=(from_start,), daemon=True)
+        tail_thread = threading.Thread(target=tail_log_file, args=(from_start, offset), daemon=True)
         tail_thread.start()
 
 def get_last_logs(count=50):
@@ -342,6 +372,18 @@ def save_config():
     config_data = request.json
     if not config_data:
         return jsonify({'status': 'error', 'message': 'Invalid payload'}), 400
+    # Merge into what is on disk so settings the form does not show (spool path, reconnect interval ...) survive a save
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            existing = json.load(f)
+    except Exception:
+        existing = {}
+    for key, value in config_data.items():
+        if isinstance(value, dict) and isinstance(existing.get(key), dict):
+            existing[key].update(value)
+        else:
+            existing[key] = value
+    config_data = existing
     if write_config(config_data):
         return jsonify({'status': 'success', 'config': config_data})
     return jsonify({'status': 'error', 'message': 'Failed to save configuration.'}), 500
@@ -368,6 +410,18 @@ def api_run_samples():
     limit = request.args.get('limit', default=2000, type=int)
     snap = run_summary.snapshot()
     return jsonify({'samples': run_summary.samples(limit), 'count': snap['count'], 'stored': snap['stored']})
+
+@app.route('/api/cycles', methods=['GET'])
+def api_cycles():
+    """Finished press cycles (OK and NG) of the current/last run, oldest first (default latest 500)."""
+    limit = request.args.get('limit', default=500, type=int)
+    return jsonify({'cycles': run_summary.cycles(limit), 'totals': run_summary.snapshot()['cycles']})
+
+@app.route('/api/link', methods=['GET'])
+def api_link():
+    """Whether the press is answering (from the reader's [LINK] reports)."""
+    pid, _ = get_running_process()
+    return jsonify(last_link if pid is not None and last_link else {'state': 'idle' if pid is None else 'connecting', 'detail': ''})
 
 @app.route('/api/run.csv', methods=['GET'])
 def api_run_csv():
@@ -398,6 +452,15 @@ def test_db():
 
     if db_type == 'none':
         return jsonify({'success': True, 'message': 'No database selected - samples are shown in the log only and are not stored.'})
+
+    if db_type == 'influxdb':
+        try:
+            from database_handler import DatabaseHandler
+            DatabaseHandler(db_cfg)  # connecting runs the reachability, credential and bucket checks
+            target = db_cfg.get('influx_bucket') or db_cfg.get('influx_database')
+            return jsonify({'success': True, 'message': f'InfluxDB at {db_cfg.get("influx_url") or "http://localhost:8086"} is reachable and accepts writes to "{target}".'})
+        except Exception as e:
+            return jsonify({'success': False, 'message': f'InfluxDB connection error: {str(e)}'})
 
     if db_type in ('postgresql', 'timescaledb'):
         try:
@@ -454,6 +517,7 @@ def handle_connect():
         emit('stats_update', last_stats)
 
     emit('run_update', run_summary.snapshot())
+    emit('link_update', last_link if is_active and last_link else {'state': 'connecting' if is_active else 'idle', 'detail': ''})
 
     logs = get_last_logs(50)
     for log_line in logs:
@@ -462,16 +526,16 @@ def handle_connect():
     if is_active:
         start_tailing()
 
-@socketio.on('start_janome')
-def handle_start(data=None):
-    """Spawns Janome JP4 ingestion process in background."""
-    data = data or {}
-    pid, mode = get_running_process()
-    if pid is not None:
-        emit('log_update', {'log': '[SYSTEM] Warning: Janome JP4 ingestion process is already running.'})
-        return
+def launch_reader(run_mode, tolerate_db_down=False, fresh=True):
+    """
+    Spawns the reader process (read_janome_jp4.py) and starts following its log.
 
-    run_mode = data.get('mode', 'mockup')
+    fresh=True begins a new run (new log, new run summary). fresh=False is an automatic
+    restart of a run that should still be going: the log is appended to and the run summary
+    continues. tolerate_db_down lets the reader start while the database is unreachable and
+    spool the data, which is what an unattended restart needs.
+    """
+    global reader_proc, last_link
     write_desired_state(True, run_mode)
 
     script_path = os.path.join(BASE_DIR, "read_janome_jp4.py")
@@ -479,45 +543,101 @@ def handle_start(data=None):
     cmd = [sys.executable, script_path, "--config", CONFIG_PATH]
     if run_mode == "mockup" or run_mode == "mock":
         cmd.append("--mock")
+    if tolerate_db_down:
+        cmd.append("--tolerate-db-down")
 
-    try:
+    offset = None
+    if fresh:
         with open(LOG_PATH, 'w', encoding='utf-8') as f:
             f.write(f"[SYSTEM] Log session initialized for JANOME JP4 mode={run_mode.upper()}\n")
+    else:
+        with open(LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"[SYSTEM] Reader process restarted automatically mode={run_mode.upper()}\n")
+        offset = os.path.getsize(LOG_PATH)
 
-        log_file = open(LOG_PATH, 'a', encoding='utf-8')
+    log_file = open(LOG_PATH, 'a', encoding='utf-8')
 
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
 
-        popen_kwargs = dict(
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            env=env,
-            cwd=DATA_DIR,
-        )
-        if sys.platform != "win32":
-            popen_kwargs["close_fds"] = True
-        else:
-            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    popen_kwargs = dict(
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=env,
+        cwd=DATA_DIR,
+    )
+    if sys.platform != "win32":
+        popen_kwargs["close_fds"] = True
+    else:
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        proc = subprocess.Popen(cmd, **popen_kwargs)
-        log_file.close()
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    log_file.close()
+    reader_proc = proc
 
-        with open(PID_PATH, 'w') as f:
-            f.write(str(proc.pid))
-        with open(MODE_PATH, 'w') as f:
-            f.write(run_mode)
+    with open(PID_PATH, 'w') as f:
+        f.write(str(proc.pid))
+    with open(MODE_PATH, 'w') as f:
+        f.write(run_mode)
 
-        socketio.emit('status_change', {'is_running': True, 'mode': run_mode})
-        socketio.emit('log_update', {'log': f'[SYSTEM] Spawning Janome JP4 process (PID: {proc.pid}) mode={run_mode.upper()}'})
+    socketio.emit('status_change', {'is_running': True, 'mode': run_mode})
+    socketio.emit('log_update', {'log': f'[SYSTEM] Spawning Janome JP4 process (PID: {proc.pid}) mode={run_mode.upper()}'})
 
+    last_link = {}
+    socketio.emit('link_update', {'state': 'connecting', 'detail': ''})
+    if fresh:
         run_summary.start(run_mode)  # a new run replaces the previous run's summary
-        socketio.emit('run_update', run_summary.snapshot())
+    else:
+        run_summary.resume()
+    socketio.emit('run_update', run_summary.snapshot())
 
+    if fresh:
         start_tailing(from_start=True)
+    else:
+        start_tailing(offset=offset)
+    return proc.pid
 
-    except Exception as e:
-        socketio.emit('log_update', {'log': f'[SYSTEM] Failed to spawn Janome JP4 process: {e}'})
+@socketio.on('start_janome')
+def handle_start(data=None):
+    """Spawns Janome JP4 ingestion process in background."""
+    data = data or {}
+    with launch_lock:
+        pid, mode = get_running_process()
+        if pid is not None:
+            emit('log_update', {'log': '[SYSTEM] Warning: Janome JP4 ingestion process is already running.'})
+            return
+        try:
+            launch_reader(data.get('mode', 'mockup'))
+        except Exception as e:
+            socketio.emit('log_update', {'log': f'[SYSTEM] Failed to spawn Janome JP4 process: {e}'})
+
+def supervise_reader():
+    """
+    Restarts the reader if it disappears while the operator wants it running (crash, killed,
+    out of memory ...). The press link itself is kept alive inside the reader; this only covers
+    the reader process. A reader that refuses to start because the database is unreachable
+    (exit code 2) is not retried, so the error stays visible until the setting is fixed.
+    """
+    while True:
+        eventlet.sleep(SUPERVISE_EVERY_S)
+        try:
+            desired = read_desired_state()
+            if not desired.get('is_running'):
+                continue
+            with launch_lock:
+                pid, _ = eventlet.tpool.execute(get_running_process)
+                if pid is not None:
+                    continue
+                code = reader_proc.poll() if reader_proc is not None else None
+                mode = desired.get('mode', 'mockup')
+                if code == 2:
+                    write_desired_state(False, mode)
+                    socketio.emit('log_update', {'log': '[SYSTEM] The reader could not start because the database is unreachable. Not retrying automatically: fix the database setting, then press Start.'})
+                    continue
+                socketio.emit('log_update', {'log': f'[SYSTEM] Reader process is not running (exit code {code}); restarting it automatically.'})
+                launch_reader(mode, tolerate_db_down=True, fresh=False)
+        except Exception as e:
+            print(f"[ERROR] Reader supervisor: {e}")
 
 @socketio.on('stop_janome')
 def handle_stop():
@@ -555,6 +675,7 @@ def handle_stop():
     run_summary.finish()
     socketio.emit('run_update', run_summary.snapshot())
     socketio.emit('status_change', {'is_running': False})
+    socketio.emit('link_update', {'state': 'idle', 'detail': ''})
     socketio.emit('log_update', {'log': '[SYSTEM] Janome JP4 Ingestion process terminated.'})
 
 # Initial recovery check on Web GUI startup
@@ -572,9 +693,15 @@ else:
     if auto_start_enabled or is_desired_running:
         target_mode = startup_cfg.get('auto_start_mode') or desired_state.get('mode', 'mockup')
         print(f"[SYSTEM] Startup config auto_start_on_startup is enabled. Auto-starting Janome JP4 ingestion in MODE={target_mode.upper()}...")
-        handle_start({'mode': target_mode})
+        try:
+            # Nobody is watching after a power-up, so do not give up if the database is not reachable yet
+            launch_reader(target_mode, tolerate_db_down=True)
+        except Exception as e:
+            print(f"[ERROR] Auto-start failed: {e}")
     else:
         print("[SYSTEM] Startup config auto_start_on_startup is disabled. Awaiting manual start trigger.")
+
+threading.Thread(target=supervise_reader, daemon=True).start()
 
 if __name__ == '__main__':
     # Served on Port 8085 unless JANOME_HOST / JANOME_PORT override it
