@@ -55,7 +55,7 @@
                     </div>
                     <div class="fact">
                         <dt>Database</dt>
-                        <dd id="telemetry-db" class="db-state db-none">Not used</dd>
+                        <dd id="telemetry-db" class="db-state db-none">Local file only</dd>
                     </div>
                 </dl>
             </section>
@@ -193,7 +193,7 @@
                         <div class="field">
                             <label for="DB_TYPE">Store readings in</label>
                             <select id="DB_TYPE" name="DB_TYPE">
-                                <option value="none">Nowhere (show in log only)</option>
+                                <option value="none">This computer only (local SQLite file)</option>
                                 <option value="sqlite">SQLite file</option>
                                 <option value="postgresql">PostgreSQL / TimescaleDB</option>
                                 <option value="influxdb">InfluxDB</option>

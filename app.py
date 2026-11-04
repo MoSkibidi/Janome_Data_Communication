@@ -20,7 +20,8 @@ import time
 from datetime import datetime, timezone
 from flask import Flask, render_template, jsonify, request, Response
 from flask_socketio import SocketIO, emit
-from run_summary import RunSummary
+import local_store
+from run_summary import RunSummary, restore_from_store
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -50,7 +51,9 @@ last_link = {}  # latest "[LINK] state=..." report from the reader: is the press
 reader_proc = None  # Popen of the reader this panel started (None after a panel restart)
 launch_lock = threading.Lock()
 SUPERVISE_EVERY_S = 5
-run_summary = RunSummary()  # statistics and samples of the current/last run, kept in memory only
+run_summary = RunSummary()  # statistics and samples of the current/last run (rebuilt from the local file after a restart)
+store = None           # local SQLite file holding every run (see local_store.py)
+current_run_id = None  # run in the local file that the reader is adding to
 
 def read_config():
     """Reads configuration parameters from config.json."""
@@ -101,6 +104,50 @@ def write_config(config_data):
     except Exception as e:
         print(f"[ERROR] Writing config.json: {e}")
         return False
+
+def open_store():
+    """Opens the local file the reader saves into; the panel reads it to rebuild the last run after a restart."""
+    global store
+    local_cfg = read_config().get('local_store', {})
+    if not local_cfg.get('enabled', True):
+        return None
+    try:
+        store = local_store.LocalStore(local_store.resolve_path(local_cfg, CONFIG_PATH),
+                                       max_rows=int(local_cfg.get('max_rows', 2000000)))
+    except Exception as e:
+        print(f"[ERROR] Cannot open the local file: {e}")
+        store = None
+    return store
+
+def finish_run():
+    """Marks the current run as ended, in memory and in the local file."""
+    run_summary.finish()
+    if store is not None and current_run_id is not None:
+        try:
+            store.end_run(current_run_id)
+        except Exception as e:
+            print(f"[ERROR] Ending the run in the local file: {e}")
+
+def restore_last_run():
+    """After a panel restart: show the last run again, rebuilt from the local file."""
+    global current_run_id
+    if store is None:
+        return
+    try:
+        run = store.latest_run()
+        if run is None:
+            return
+        current_run_id = run['id']
+        restore_from_store(run_summary, store, run['id'])
+        pid, _ = get_running_process()
+        if run['ended_at'] is None and pid is None:
+            # The reader is gone (the computer was switched off, for example): close the run at its last reading
+            when = store.last_activity(run['id'])
+            ended = datetime.fromisoformat(when) if when else None
+            store.end_run(run['id'], ended)
+            run_summary.finish(ended)
+    except Exception as e:
+        print(f"[ERROR] Restoring the last run: {e}")
 
 def read_desired_state():
     """Reads persistent desired state metadata across reboots."""
@@ -248,7 +295,7 @@ def tail_log_file(from_start=False, offset=None):
                 if pid is None:
                     socketio.emit('status_change', {'is_running': False})
                     socketio.emit('link_update', {'state': 'idle', 'detail': ''})
-                    run_summary.finish()
+                    finish_run()
                     socketio.emit('run_update', run_summary.snapshot())
                     if os.path.exists(PID_PATH):
                         try: os.remove(PID_PATH)
@@ -425,11 +472,17 @@ def api_link():
 
 @app.route('/api/run.csv', methods=['GET'])
 def api_run_csv():
-    """Every stored sample of the current/last run as a CSV download."""
+    """Every reading of the current/last run as a CSV download (all of them, from the local file when there is one)."""
     started = run_summary.snapshot()['started_at'] or ''
     stamp = re.sub(r'[^0-9]', '', started)[:14] or 'run'
+    text = None
+    if store is not None and current_run_id is not None:
+        try:
+            text = store.csv_text(current_run_id)
+        except Exception as e:
+            print(f"[ERROR] Reading the local file for the CSV: {e}")
     return Response(
-        run_summary.csv_text(),
+        text if text is not None else run_summary.csv_text(),
         mimetype='text/csv',
         headers={'Content-Disposition': f'attachment; filename=janome_run_{stamp}.csv'}
     )
@@ -451,7 +504,7 @@ def test_db():
     db_type = db_cfg.get('db_type', 'none')
 
     if db_type == 'none':
-        return jsonify({'success': True, 'message': 'No database selected - samples are shown in the log only and are not stored.'})
+        return jsonify({'success': True, 'message': 'No database selected - readings are kept in the local SQLite file on this computer only.'})
 
     if db_type == 'influxdb':
         try:
@@ -545,6 +598,17 @@ def launch_reader(run_mode, tolerate_db_down=False, fresh=True):
         cmd.append("--mock")
     if tolerate_db_down:
         cmd.append("--tolerate-db-down")
+
+    global current_run_id
+    if store is not None:
+        try:
+            if fresh or current_run_id is None:
+                current_run_id = store.start_run(run_mode)
+            else:
+                store.reopen_run(current_run_id)  # automatic restart: same run
+            cmd += ["--run-id", str(current_run_id)]
+        except Exception as e:
+            print(f"[ERROR] Starting a run in the local file: {e}")
 
     offset = None
     if fresh:
@@ -645,7 +709,7 @@ def handle_stop():
     pid, _ = get_running_process()
     if pid is None:
         socketio.emit('status_change', {'is_running': False})
-        run_summary.finish()
+        finish_run()
         socketio.emit('run_update', run_summary.snapshot())
         emit('log_update', {'log': '[SYSTEM] Warning: Ingestion process is not running. Resetting UI state.'})
         if os.path.exists(PID_PATH):
@@ -672,13 +736,15 @@ def handle_stop():
         try: os.remove(MODE_PATH)
         except: pass
 
-    run_summary.finish()
+    finish_run()
     socketio.emit('run_update', run_summary.snapshot())
     socketio.emit('status_change', {'is_running': False})
     socketio.emit('link_update', {'state': 'idle', 'detail': ''})
     socketio.emit('log_update', {'log': '[SYSTEM] Janome JP4 Ingestion process terminated.'})
 
 # Initial recovery check on Web GUI startup
+open_store()
+restore_last_run()
 pid, mode = get_running_process()
 if pid is not None:
     print(f"[SYSTEM] Detected active Janome JP4 process running (PID: {pid}). Re-attaching...")

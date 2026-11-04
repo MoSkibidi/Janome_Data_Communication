@@ -33,6 +33,7 @@ has been verified live against a real JP4 press:
 | File | Purpose |
 |---|---|
 | `read_janome_jp4.py` | Core driver: builds/parses protocol frames, reads position/load telemetry, writes to a database on an interval. Also usable standalone via CLI (`--mock` for driver-free testing, `--once` for a single read). |
+| `local_store.py` | The local SQLite file with every run's readings and cycles (always written; see Database behaviour). |
 | `database_handler.py` | SQLite/PostgreSQL/InfluxDB storage backend for the ingestion driver. |
 | `run_summary.py` | In-memory statistics and samples of the current/last run (Run summary card, CSV download). |
 | `app.py` | Flask-SocketIO web control panel (port 8085) - configure the serial port, start/stop real or mock ingestion, view live telemetry. |
@@ -114,9 +115,20 @@ Details worth knowing:
 
 The database engine is chosen in the panel (`database.db_type` in `config.json`):
 
-- **`none` (default, "log only"):** samples are read and shown in the log only;
-  nothing is stored and no database file is created. The pipeline log is
-  overwritten each time ingestion is started, so it only holds the current run.
+- **Local file (always on):** every reading and every finished cycle is also saved
+  in `janome_jp4_local.db`, a small SQLite file next to `config.json` (so in
+  `JANOME_DATA_DIR`), grouped by run (Start to Stop). It is written whether or not a
+  database is configured, so the data is on this computer even while the database
+  server is down. Each write is committed with `synchronous=FULL` (survives a crash or
+  power cut). The file is bounded: beyond `local_store.max_rows` readings (default
+  2,000,000, about 23 days at one reading a second) the oldest readings are deleted.
+  Optional `config.json` section: `"local_store": {"enabled": true, "path": "...",
+  "max_rows": 2000000}`. If the file cannot be written, collection carries on and a
+  `[LOCAL]` warning is logged. The pipeline log is still overwritten at each Start.
+  This file is the history; the spool described below is the queue of what has not
+  reached the database yet.
+- **`none` ("This computer only", default):** nothing is sent anywhere; the local file
+  above is the only copy.
 - **`sqlite` / `postgresql` (PostgreSQL or TimescaleDB):**
   - The connection is checked when ingestion starts. If it fails, a
     `[DB ERROR]` line is logged and ingestion does **not** start (exit code 2).
@@ -165,19 +177,23 @@ The database engine is chosen in the panel (`database.db_type` in `config.json`)
 
 ## Run summary (temporary data of a run)
 
-The panel keeps the readings of the current or last run in memory and shows a
+The panel shows the current or last run in a
 **Run summary** card: min, max, average, standard deviation and latest value of
 actual position, programmed position and load, plus a table of every reading.
 
 - A run is everything from **Start** (or **Start simulation**) to **Stop**.
   Statistics cover the whole run, however long it is. They stay on screen after
   Stop, until the next Start replaces them.
-- Data is **memory only**. It is lost when the panel restarts and nothing is
-  written to disk (the database setting is independent of this).
-- The table keeps the latest 50,000 readings (`RunSummary(max_samples=...)` in
-  `app.py`). Statistics still cover every reading; the card says so when older
-  readings were dropped. The browser shows the latest 2,000 rows.
-- **Download CSV** (`/api/run.csv`, times in UTC) gives all stored readings.
+- The numbers are rebuilt from the local file when the panel restarts, so the last
+  run is still there after a panel restart or a reboot. If the computer was switched
+  off during a run, that run is closed at its last reading. An automatic start after a
+  reboot begins a new run (there is a gap in the data, so it is not glued on).
+- The page keeps the latest 50,000 readings of the run in memory
+  (`RunSummary(max_samples=...)` in `app.py`). Statistics still cover every reading;
+  the card says so when older readings were dropped. The browser shows the latest
+  2,000 rows.
+- **Download CSV** (`/api/run.csv`, times in UTC) gives all readings of the run,
+  read from the local file (not limited to the 50,000 in memory).
   JSON endpoints: `/api/run` (summary) and `/api/run/samples?limit=N`.
 - Each `[STATS]` line from the reader ends with `time=<ISO time>`, the moment the
   reading was taken; the panel uses it for the sample timestamps.

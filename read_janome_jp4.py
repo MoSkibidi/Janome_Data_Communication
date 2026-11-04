@@ -7,6 +7,7 @@ import sys
 import argparse
 import logging
 import datetime
+import local_store
 from database_handler import DatabaseHandler, BufferedDatabaseWriter, DiskSpool
 
 # Ensure UTF-8 output encoding on Windows consoles to prevent UnicodeEncodeError
@@ -560,8 +561,11 @@ def describe_db(db_cfg, db_type):
     return f"{db_type} database '{db_cfg.get('db_name')}' at {db_cfg.get('host')}:{db_cfg.get('port')}"
 
 
-def make_cycle_handler(writer):
-    """Returns a function that logs finished cycles ([CYCLE] line, [NG] warning) and queues them for the database."""
+def make_cycle_handler(writer, keep_local=None):
+    """
+    Returns a function that logs finished cycles ([CYCLE] line, [NG] warning), queues them for
+    the database and, through keep_local(kind, when, data), saves them in the local file.
+    """
     last_time = [None]
 
     def handle(cycles):
@@ -577,6 +581,8 @@ def make_cycle_handler(writer):
                     f"end {cycle['end_position_mm']} mm / {cycle['end_load_n']} N, "
                     f"{cycle['fault_total']} fault cycle(s) so far."
                 )
+            if keep_local:
+                keep_local("cycle", received_at, cycle)
             if writer:
                 writer.submit(dict(cycle, _kind="cycle"), received_at)
         if cycles:
@@ -586,7 +592,7 @@ def make_cycle_handler(writer):
 
 
 def run_ingestion_loop(config_path="config.json", max_iterations=None, override_interval=None, override_port=None,
-                       mock_mode=False, tolerate_db_down=False, stop_event=None):
+                       mock_mode=False, tolerate_db_down=False, stop_event=None, run_id=None):
     """
     Main loop that continuously reads position/load telemetry and finished-cycle results from
     the JANOME JP4 press and saves them to the database. The press link is kept alive
@@ -595,6 +601,11 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
     tolerate_db_down: start even if the database cannot be reached and spool everything until it
     is back (used for automatic restarts, where nobody is there to fix the database setting).
     stop_event: optional threading.Event; setting it ends the loop cleanly (used by tests).
+    run_id: the run (in the local file) this process adds to; the panel creates it. Without one the
+    reader starts and ends its own run.
+
+    Everything read is also saved in the local SQLite file (see local_store.py), whether or not a
+    database is configured, so the data is on this computer even while the database server is down.
     """
     config = load_config(config_path)
 
@@ -619,8 +630,12 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
     print(f"  Mode:          {'MOCK (Synthetic Hardware Simulation)' if mock_mode else 'REAL (Physical Hardware RS-232)'}")
     print(f"  Serial Port:   {port} @ {baudrate} bps")
     print(f"  Interval Time: {interval_time} seconds")
+    local_cfg = config.get("local_store", {})
+    local_enabled = local_cfg.get("enabled", True)
+    local_path = local_store.resolve_path(local_cfg, config_path)
+    print(f"  Local file:    {local_path if local_enabled else 'OFF (nothing is kept on this computer)'}")
     if log_only:
-        print("  Database:      NONE (log only - samples are not stored)")
+        print("  Database:      NONE (data is kept in the local file only)")
     else:
         print(f"  Database:      {describe_db(db_cfg, db_type)}")
         if db_type == "influxdb":
@@ -633,6 +648,8 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
 
     session = None
     writer = None
+    local = None
+    own_run = False
 
     try:
         # Check the database first so a bad DB setting fails fast, before the serial port is opened
@@ -648,7 +665,7 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                 where = describe_db(db_cfg, db_type)
                 if spool.count == 0 and not tolerate_db_down:
                     logger.error(f"[DB ERROR] Cannot connect to {where}: {err}")
-                    logger.error("[DB ERROR] Ingestion not started. Fix the database settings or set the database to 'None (log only)'.")
+                    logger.error("[DB ERROR] Ingestion not started. Fix the database settings or set the database to 'This computer only'.")
                     spool.close()
                     return 2
                 # Keep collecting and send everything once the DB is back (earlier samples on disk, or an automatic restart)
@@ -669,11 +686,36 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                 connected=db_connected,
             )
 
+        if local_enabled:
+            try:
+                local = local_store.LocalStore(local_path, max_rows=int(local_cfg.get("max_rows", 2000000)))
+                if run_id is None:
+                    run_id = local.start_run("mock" if mock_mode else "real")
+                    own_run = True
+            except Exception as err:
+                local = None
+                logger.warning(f"[LOCAL] Cannot open the local file '{local_path}': {err}. Continuing without it.")
+        local_failures = [0]
+
+        def keep_local(kind, when, data):
+            """Saves one reading or cycle in the local file; a problem here never stops the collection."""
+            if local is None:
+                return
+            try:
+                if kind == "cycle":
+                    local.add_cycle(run_id, when, data)
+                else:
+                    local.add_sample(run_id, when, data)
+            except Exception as err:
+                local_failures[0] += 1
+                if local_failures[0] in (1, 100, 10000):
+                    logger.warning(f"[LOCAL] Could not save to the local file ({err}); {local_failures[0]} failure(s) so far.")
+
         if mock_mode:
             session = PressSession(lambda: MockJanomeJP4Press(port="MOCK", baudrate=baudrate, timeout=timeout), reconnect_interval)
         else:
             session = PressSession(lambda: JanomeJP4Press(port=port, baudrate=baudrate, timeout=timeout), reconnect_interval)
-        handle_cycles = make_cycle_handler(writer)
+        handle_cycles = make_cycle_handler(writer, keep_local)
 
         iteration = 0
         print(f"\nStarting data collection loop (interval: {interval_time}s). Press Ctrl+C to stop.\n")
@@ -697,6 +739,7 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                         f"       4. To run in driver-free simulation mode, use: python read_janome_jp4.py --mock"
                     )
             else:
+                keep_local("sample", read_at, data)
                 if writer:
                     writer.submit(data, read_at)
                     db_state = "connected" if writer.connected else "down"
@@ -706,7 +749,7 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                         print(f"  -> Success! Sample read; DATABASE DOWN - {writer.pending} sample(s) spooled to disk, retrying.")
                 else:
                     db_state = "none"
-                    print("  -> Success! Sample read (log only, not stored).")
+                    print("  -> Success! Sample read (kept in the local file only).")
                 print(f"     Encoder Position: {data['encoder_position_mm']} mm | Teaching Position: {data['teaching_position_mm']} mm | Load: {data['load_n']} N")
                 written = writer.written if writer else 0
                 db_errors = writer.db_errors if writer else 0
@@ -740,6 +783,13 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
             session.close()
         if writer:
             writer.close()
+        if local is not None:
+            if own_run:
+                try:
+                    local.end_run(run_id)
+                except Exception:
+                    pass
+            local.close()
         print("Service shutdown complete.")
     return 0
 
@@ -754,6 +804,9 @@ if __name__ == "__main__":
     parser.add_argument("--tolerate-db-down", action="store_true",
                         help="Start even if the database is unreachable and spool samples until it is back (automatic restarts)")
 
+    parser.add_argument("--run-id", type=int, default=None,
+                        help="Run (in the local file) to add to; given by the panel, so the panel and the reader agree on the run")
+
     args = parser.parse_args()
 
     max_iter = 1 if args.once else None
@@ -764,4 +817,5 @@ if __name__ == "__main__":
         override_port=args.port,
         mock_mode=args.mock,
         tolerate_db_down=args.tolerate_db_down,
+        run_id=args.run_id,
     ))

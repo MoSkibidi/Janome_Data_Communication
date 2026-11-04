@@ -44,6 +44,20 @@ class _Accumulator:
         }
 
 
+def restore_from_store(summary, store, run_id):
+    """Rebuilds a RunSummary (statistics, samples, cycles) from a run saved in the local file."""
+    run = store.get_run(run_id)
+    if run is None:
+        return
+    summary.start(run["mode"], datetime.fromisoformat(run["started_at"]))
+    for ts, encoder, teaching, load in store.run_samples(run_id):
+        summary.add(datetime.fromisoformat(ts), encoder, teaching, load)
+    for cycle in store.run_cycles(run_id):
+        summary.add_cycle(datetime.fromisoformat(cycle["time"]), cycle)
+    if run["ended_at"]:
+        summary.finish(datetime.fromisoformat(run["ended_at"]))
+
+
 class RunSummary:
     """
     Statistics and samples for one run (from Start to Stop).

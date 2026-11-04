@@ -431,5 +431,82 @@ class DatabaseFailCases(unittest.TestCase):
         self.assertGreater(conn.execute("SELECT COUNT(*) FROM janome_jp4_telemetry").fetchone()[0], 0)
 
 
+class LocalFileCases(unittest.TestCase):
+    """The local SQLite file keeps everything that was read, with or without a database server."""
+
+    def local_db(self, run):
+        return os.path.join(run.tmp, "janome_jp4_local.db")
+
+    def test_no_database_configured_still_writes_readings_and_cycles_to_the_local_file(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}}).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(result_code=3232)
+        wait_for(lambda: run.count("[CYCLE]") >= 1)
+        wait_for(lambda: run.count("[STATS]") >= 4)
+        run.finish()
+        conn = sqlite3.connect(self.local_db(run))
+        self.assertGreaterEqual(conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0], 4)
+        payload = json.loads(conn.execute("SELECT payload FROM cycles").fetchone()[0])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["result_code"], 3232)
+        started, ended = conn.execute("SELECT started_at, ended_at FROM runs").fetchone()
+        self.assertIsNotNone(ended, "a run the reader started itself is closed when it stops")
+
+    def test_database_server_down_data_is_still_in_the_local_file(self):
+        influx = FakeInflux()
+        self.addCleanup(influx.stop)
+        influx.down = True
+        cfg = {"db_type": "influxdb", "influx_url": influx.url, "influx_token": "secret",
+               "influx_org": "o", "influx_bucket": "b", "retry_interval": 0.2}
+        run = LoopRunner(self, {"database": cfg}, tolerate_db_down=True).start()
+        wait_for(lambda: run.count("[STATS]") >= 5)
+        run.finish()
+        conn = sqlite3.connect(self.local_db(run))
+        self.assertGreaterEqual(conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0], 5)
+        self.assertEqual(influx.lines(), [])
+
+    def test_the_panel_run_id_is_used_and_the_run_stays_open(self):
+        from local_store import LocalStore
+        run = LoopRunner(self, {"database": {"db_type": "none"}}, run_id=1)
+        store = LocalStore(self.local_db(run))
+        self.assertEqual(store.start_run("real"), 1)
+        run.start()
+        wait_for(lambda: run.count("[STATS]") >= 3)
+        run.finish()
+        self.assertGreaterEqual(store.count_samples(1), 3)
+        self.assertIsNone(store.get_run(1)["ended_at"], "the panel, not the reader, ends a run it created")
+
+    def test_panel_rebuilds_the_last_run_after_a_restart(self):
+        from local_store import LocalStore
+        from run_summary import RunSummary, restore_from_store
+        store = LocalStore(os.path.join(tempfile.mkdtemp(), "l.db"))
+        run_id = store.start_run("real")
+        base = datetime(2026, 11, 5, 1, 0, 0, tzinfo=timezone.utc)
+        for i in range(10):
+            store.add_sample(run_id, base.replace(second=i), {"encoder_position_mm": float(i), "teaching_position_mm": 0.0, "load_n": 100.0})
+        store.add_cycle(run_id, base, {"ok": False, "result_code": 3225})
+        store.end_run(run_id, base.replace(second=30))
+        summary = RunSummary()
+        restore_from_store(summary, store, run_id)
+        snap = summary.snapshot()
+        self.assertEqual((snap["state"], snap["count"]), ("finished", 10))
+        self.assertEqual(snap["stats"]["encoder_position_mm"]["max"], 9.0)
+        self.assertEqual(snap["cycles"], {"total": 1, "ok": 0, "ng": 1})
+        self.assertEqual(len(store.csv_text(run_id).splitlines()), 11)
+
+    def test_the_file_is_bounded_oldest_readings_go_first(self):
+        from local_store import LocalStore
+        store = LocalStore(os.path.join(tempfile.mkdtemp(), "l.db"), max_rows=1000)
+        run_id = store.start_run("real")
+        now = datetime.now(timezone.utc)
+        for i in range(1300):
+            store.add_sample(run_id, now, {"encoder_position_mm": float(i), "teaching_position_mm": 0.0, "load_n": 0.0})
+        store.prune()
+        self.assertEqual(store.count_samples(), 1000)
+        first = next(store.run_samples(run_id))
+        self.assertEqual(first[1], 300.0)
+
+
 if __name__ == "__main__":
     unittest.main()

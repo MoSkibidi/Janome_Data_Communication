@@ -321,7 +321,7 @@ document.addEventListener('DOMContentLoaded', () => {
             elDb.textContent = waiting > 1 ? `Connected - sending ${waiting}` : 'Connected';
             elDb.className = 'db-state db-ok';
         } else {
-            elDb.textContent = 'Not used';
+            elDb.textContent = 'Local file only';
             elDb.className = 'db-state db-none';
         }
     }
