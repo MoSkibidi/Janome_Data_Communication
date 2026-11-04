@@ -1,0 +1,47 @@
+services:
+  influxdb:
+    image: influxdb:2.7
+    container_name: janome-influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: janome-admin-pw     # change before exposing this beyond your own machine
+      DOCKER_INFLUXDB_INIT_ORG: janome
+      DOCKER_INFLUXDB_INIT_BUCKET: janome_jp4
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: janome-local-dev-token   # change before exposing this beyond your own machine
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+
+  app:
+    build: .
+    container_name: janome-panel
+    restart: unless-stopped
+    depends_on:
+      - influxdb
+    ports:
+      - "8085:8085"
+    environment:
+      JANOME_DATA_DIR: /data
+      # Overrides config.json's database.influx_* fields so this container always talks to
+      # the influxdb service above, whatever is baked into the image's config.json.
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: janome-local-dev-token
+      INFLUX_ORG: janome
+      INFLUX_BUCKET: janome_jp4
+    volumes:
+      - janome-data:/data
+    # A container cannot see a Windows COM port by default. On Windows + Docker Desktop,
+    # attach the USB-serial adapter to the WSL2 VM first with usbipd-win (see README's
+    # "Docker" section), note the /dev/ttyUSBx it appears as, then uncomment this with
+    # that path. Until then, use Simulation mode in the panel.
+    # devices:
+    #   - "/dev/ttyUSB0:/dev/ttyUSB0"
+
+volumes:
+  influxdb-data:
+  influxdb-config:
+  janome-data:

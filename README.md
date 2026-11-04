@@ -40,6 +40,7 @@ has been verified live against a real JP4 press:
 | `quick_test.py` | Minimal standalone CLI script - opens the port, sends a few commands, prints raw TX/RX bytes. No Flask/database dependency. |
 | `serial_test_webapp.py` | Full diagnostic web app (port 8086) - command picker covering all read/control commands in plain language, a Poll Set for program settings (S2), a one-shot Quality Data capture, and a **Live Cycle Monitor** that logs every completed press cycle automatically (with link keep-alive). |
 | `run_service.bat`, `deploy/` | Foreground launcher plus auto-start at boot: `install_autostart.ps1` / `uninstall_autostart.ps1` (Windows scheduled task) and `janome-panel.service` (Linux systemd). |
+| `Dockerfile`, `docker-compose.yml` | Container image for the panel (`app.py`) and a local InfluxDB instance wired together - see **Docker** below. |
 | `tests/test_fail_cases.py` | Fault-injection tests (fake press, fake InfluxDB): cable pulled, press power-cycle, NG cycle, network outage, restart with spool, retention. |
 | `config.json` | Serial port, baud rate, database, and startup settings for `read_janome_jp4.py` / `app.py`. |
 
@@ -84,6 +85,42 @@ port in the panel, then start real or mock ingestion.
 **Windows background run:** `run.bat` starts the panel hidden (logs in
 `logs\panel.log`) and `stop.bat` stops it.
 
+## Docker (panel + local InfluxDB, one command)
+
+```bash
+docker compose up -d --build
+```
+
+This starts two containers, wired together with no manual setup:
+
+- **`influxdb`** - an InfluxDB 2.7 instance, pre-initialized (org `janome`, bucket
+  `janome_jp4`, admin user `admin`, admin token `janome-local-dev-token`) via the
+  `DOCKER_INFLUXDB_INIT_*` variables in `docker-compose.yml`. UI at `http://localhost:8086`.
+- **`app`** - the control panel (`app.py`), built from the `Dockerfile`, at
+  `http://localhost:8085`. It is pointed at the `influxdb` container through the
+  `INFLUX_URL` / `INFLUX_TOKEN` / `INFLUX_ORG` / `INFLUX_BUCKET` environment variables set
+  on the `app` service; these override whatever is in `config.json`'s `database.influx_*`
+  fields (see `_apply_env_overrides` in `database_handler.py`), so the image works out of
+  the box without editing `config.json` inside the container.
+
+**Change the admin password and token** in `docker-compose.yml` before exposing either
+port beyond your own machine - they are checked-in development defaults.
+
+Both containers' data survive `docker compose down` (not `down -v`): the panel's
+`config.json`, local SQLite file and spool live in the `janome-data` volume
+(`JANOME_DATA_DIR=/data`), and InfluxDB's own storage lives in `influxdb-data`.
+
+**Serial port on Windows:** Docker Desktop containers cannot see a Windows COM port
+directly. To reach a real press from the `app` container:
+1. Install [usbipd-win](https://github.com/dorssel/usbipd-win) on the Windows host.
+2. `usbipd list` to find the USB-serial adapter's bus ID, then `usbipd bind --busid=<id>`
+   and `usbipd attach --wsl --busid=<id>` to share it into the WSL2 VM Docker Desktop uses.
+3. Inside WSL2, check what it came up as (`ls /dev/ttyUSB*` / `ls /dev/ttyACM*`).
+4. Uncomment the `devices:` line under `app` in `docker-compose.yml`, pointing it at that
+   path, then `docker compose up -d` again.
+
+Until that is done, use **Simulation** mode in the panel to exercise the rest of the stack.
+
 ## Fail cases and how the program handles them
 
 | # | Situation | What happens |
@@ -127,8 +164,8 @@ The database engine is chosen in the panel (`database.db_type` in `config.json`)
   `[LOCAL]` warning is logged. The pipeline log is still overwritten at each Start.
   This file is the history; the spool described below is the queue of what has not
   reached the database yet.
-- **`none` ("This computer only", default):** nothing is sent anywhere; the local file
-  above is the only copy.
+- **`none` ("This computer only"):** nothing is sent anywhere; the local file above is
+  the only copy.
 - **`sqlite` / `postgresql` (PostgreSQL or TimescaleDB):**
   - The connection is checked when ingestion starts. If it fails, a
     `[DB ERROR]` line is logged and ingestion does **not** start (exit code 2).
@@ -155,7 +192,7 @@ The database engine is chosen in the panel (`database.db_type` in `config.json`)
   - The `[STATS]` line reports `db_state` (`connected`/`down`/`none`),
     `db_pending` (memory + spool) and `db_dropped`; `written` counts rows
     actually committed.
-- **`influxdb`:** same connection check, buffering and spool as above. Two
+- **`influxdb`** (default): same connection check, buffering and spool as above. Two
   measurements are written: telemetry (`influx_measurement`, default
   `janome_jp4_telemetry`; fields `encoder_position_mm`, `teaching_position_mm`,
   `load_n`) and cycles (`influx_cycle_measurement`, default

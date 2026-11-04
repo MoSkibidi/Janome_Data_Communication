@@ -1,0 +1,10 @@
+.git
+__pycache__
+*.pyc
+.venv
+logs
+*.db
+*.log
+.janome_jp4_process.pid
+.janome_jp4_process.mode
+.janome_jp4_desired_state.json

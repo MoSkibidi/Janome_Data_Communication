@@ -69,7 +69,7 @@ def read_config():
             "timeout": 2.0
         },
         "database": {
-            "db_type": "none",
+            "db_type": "influxdb",
             "db_name": "janome_jp4_data.db",
             "table_name": "janome_jp4_telemetry",
             "host": "localhost",
@@ -77,6 +77,14 @@ def read_config():
             "user": "admin",
             "password": "admin",
             "sqlite_path": "janome_jp4_data.db",
+            "influx_url": "http://localhost:8086",
+            "influx_version": "2",
+            "influx_token": "janome-local-dev-token",
+            "influx_org": "janome",
+            "influx_bucket": "janome_jp4",
+            "influx_measurement": "janome_jp4_telemetry",
+            "influx_cycle_measurement": "janome_jp4_telemetry_cycles",
+            "influx_retention_days": 30,
             "description": "Database storage for JANOME Electro Press JP4 telemetry data"
         },
         "acquisition": {

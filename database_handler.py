@@ -44,6 +44,26 @@ def _lp_escape(text):
     return str(text).replace("\\", "\\\\").replace(",", "\\,").replace(" ", "\\ ").replace("=", "\\=")
 
 
+_INFLUX_ENV_OVERRIDES = {
+    "INFLUX_URL": "influx_url",
+    "INFLUX_TOKEN": "influx_token",
+    "INFLUX_ORG": "influx_org",
+    "INFLUX_BUCKET": "influx_bucket",
+}
+
+
+def _apply_env_overrides(db_config):
+    """
+    Lets a deployment (e.g. the Docker Compose stack, which only knows the InfluxDB
+    container's address/token at `docker compose up` time) point this at InfluxDB via
+    environment variables instead of editing config.json. Only applied when set.
+    """
+    for env_name, key in _INFLUX_ENV_OVERRIDES.items():
+        value = os.environ.get(env_name)
+        if value:
+            db_config[key] = value
+
+
 class DatabaseHandler:
     def __init__(self, db_config, connect=True):
         """
@@ -53,6 +73,7 @@ class DatabaseHandler:
         With connect=False nothing is opened yet; the first reconnect() connects and
         creates the table (used when starting while the database is still down).
         """
+        _apply_env_overrides(db_config)
         self.config = db_config
         self.db_type = db_config.get("db_type", "sqlite").lower()
         self.db_name = db_config.get("db_name", "janome_jp4_data.db")
