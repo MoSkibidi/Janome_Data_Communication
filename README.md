@@ -58,6 +58,32 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+## First-time deployment (Windows PC next to the press)
+
+1. **Install** Python 3.12 (64-bit, tick "Add python.exe to PATH") and Git.
+2. **Install the driver** of the USB-RS232 adapter, then look up its port (COMx) in Device Manager.
+3. **Get the code and the libraries** (do not copy a `.venv` from another PC: it is tied to the path it was made in):
+   ```bash
+   git clone https://github.com/MoSkibidi/Janome_Data_Communication.git
+   cd Janome_Data_Communication
+   python -m venv .venv
+   .venv\Scripts\pip install -r requirements.txt
+   ```
+   Without the `.venv`, `run.bat` falls back to the global `python`, which has none of the libraries
+   (the reason is then in `logs\panel.log`).
+4. **Edit `config.json`** (or do it later in the panel's Settings): `serial.port` (and baud rate 9600),
+   `csv_export.folder` (a folder this PC has; the program creates it), and `database.influx_url` / token /
+   org / bucket of the InfluxDB to send to, or choose "This computer only" when there is none.
+   `config.json` in the repository contains an InfluxDB token: keep the repository private and change the token for each site.
+5. **Start**: `run.bat` (hidden window, `stop.bat` stops it), open `http://localhost:8085`, check that the
+   port is the right one, press Start. Watch the Event log card: `START` lines and no `COMM ERROR`.
+6. **Start by itself after a reboot** (optional): in an Administrator PowerShell run
+   `powershell -ExecutionPolicy Bypass -File deploy\install_autostart.ps1 -Mode Startup` (or `-Mode Logon`
+   without administrator rights), and tick "Start reading automatically" in Settings > Startup.
+7. **Reach the panel from another PC** (optional): allow TCP port 8085 in Windows Firewall.
+
+A new PC starts clean: databases (`*.db`), `logs/` and the state files are not in git on purpose.
+
 ## Running
 
 **Diagnostic tool (recommended starting point):**
