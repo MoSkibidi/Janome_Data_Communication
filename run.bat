@@ -1,5 +1,6 @@
 @echo off
 rem Starts the Janome JP4 Control Panel in the background, with no window (default port 8085).
+rem Works for the packaged program (JanomeJP4.exe next to this file) and for the source tree (python app.py).
 rem English comments only
 
 cd /d "%~dp0"
@@ -12,6 +13,15 @@ if %errorlevel% equ 0 (
     echo [SYSTEM] Port %JANOME_PORT% is already in use. Janome JP4 may already be running.
     echo [SYSTEM] Run stop.bat first if you want to restart it.
     exit /b 1
+)
+
+if not exist "logs" mkdir "logs"
+
+rem The packaged program needs no Python at all
+if exist "JanomeJP4.exe" (
+    set "PANEL_CMD=.\JanomeJP4.exe"
+    echo [SYSTEM] Using the packaged program JanomeJP4.exe
+    goto launch
 )
 
 rem Resolve Python binary (prefer virtualenv python over global python)
@@ -30,17 +40,17 @@ if "%PYTHON_BIN%"=="python" (
         exit /b 1
     )
 )
-
-if not exist "logs" mkdir "logs"
-
+set "PANEL_CMD=%PYTHON_BIN% app.py"
 echo [SYSTEM] Using Python interpreter: %PYTHON_BIN%
+
+:launch
 echo [SYSTEM] Starting Janome JP4 Control Panel on port %JANOME_PORT% (all interfaces)...
 rem The panel runs in a hidden window: nothing to close by mistake. Set JANOME_SHOW_WINDOW=1 to see it (minimized) while debugging.
 if "%JANOME_SHOW_WINDOW%"=="1" goto show_window
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath cmd.exe -ArgumentList '/c title JANOME_JP4_PANEL && %PYTHON_BIN% app.py >> logs\panel.log 2>&1' -WorkingDirectory '%CD%' -WindowStyle Hidden"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath cmd.exe -ArgumentList '/c title JANOME_JP4_PANEL && %PANEL_CMD% >> logs\panel.log 2>&1' -WorkingDirectory '%CD%' -WindowStyle Hidden"
 goto started
 :show_window
-start "JANOME_JP4_PANEL" /min cmd /c "title JANOME_JP4_PANEL && %PYTHON_BIN% app.py >> logs\panel.log 2>&1"
+start "JANOME_JP4_PANEL" /min cmd /c "title JANOME_JP4_PANEL && %PANEL_CMD% >> logs\panel.log 2>&1"
 :started
 
 echo [SYSTEM] Accessible at http://localhost:%JANOME_PORT%

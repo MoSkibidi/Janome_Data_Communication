@@ -616,6 +616,115 @@ class DatabaseProofCases(unittest.TestCase):
         self.assertTrue(left, "the log says how many readings wait on disk for the next start")
 
 
+class AutostartCases(unittest.TestCase):
+    """'Start with Windows' from the panel: Logon needs no administrator, Startup opens the permission window."""
+
+    class Result:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+    def setUp(self):
+        import autostart
+        self.autostart = autostart
+        self.base = tempfile.mkdtemp()
+        for name in ("install_autostart.ps1", "uninstall_autostart.ps1"):
+            with open(os.path.join(self.base, name), "w") as f:
+                f.write("# test")
+        self.calls = []
+        saved = (autostart.supported, autostart.is_admin)
+        autostart.supported = lambda: True
+        autostart.is_admin = lambda: False
+        self.addCleanup(lambda: (setattr(autostart, "supported", saved[0]), setattr(autostart, "is_admin", saved[1])))
+
+    def runner(self, *results):
+        queue = list(results)
+
+        def run(cmd, **kwargs):
+            self.calls.append(cmd)
+            return queue.pop(0) if queue else self.Result()
+        return run
+
+    def test_status_tells_boot_and_login_tasks_apart(self):
+        a = self.autostart
+        self.assertEqual(a.status(run=self.runner(self.Result(stdout="SYSTEM|Ready\n")))["mode"], "Startup")
+        self.assertEqual(a.status(run=self.runner(self.Result(stdout="PC\\Operator|Ready\n")))["mode"], "Logon")
+        off = a.status(run=self.runner(self.Result(stdout="")))
+        self.assertFalse(off["installed"])
+        self.assertIsNone(off["mode"])
+
+    def test_login_start_is_installed_directly_without_the_permission_window(self):
+        result = self.autostart.enable("Logon", self.base, run=self.runner())
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["pending"])
+        self.assertIn("-Mode", self.calls[0])
+        self.assertEqual(self.calls[0][self.calls[0].index("-Mode") + 1], "Logon")
+        self.assertNotIn("RunAs", " ".join(self.calls[0]))
+
+    def test_boot_start_without_administrator_opens_the_permission_window(self):
+        result = self.autostart.enable("Startup", self.base, run=self.runner())
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["pending"], "the person approves on the PC; the panel waits for the result")
+        command = " ".join(self.calls[0])
+        self.assertIn("-Verb RunAs", command)
+        self.assertIn("install_autostart.ps1", command)
+        self.assertIn("'Startup'", command)
+
+    def test_boot_start_as_administrator_is_installed_directly(self):
+        self.autostart.is_admin = lambda: True
+        result = self.autostart.enable("Startup", self.base, run=self.runner())
+        self.assertTrue(result["ok"] and not result["pending"])
+        self.assertNotIn("RunAs", " ".join(self.calls[0]))
+
+    def test_a_bad_mode_or_missing_script_is_refused_without_running_anything(self):
+        self.assertFalse(self.autostart.enable("Whenever", self.base, run=self.runner())["ok"])
+        self.assertFalse(self.autostart.enable("Logon", tempfile.mkdtemp(), run=self.runner())["ok"])
+        self.assertEqual(self.calls, [])
+
+    def test_a_failed_install_reports_the_reason(self):
+        result = self.autostart.enable("Logon", self.base, run=self.runner(self.Result(1, "", "Access is denied")))
+        self.assertFalse(result["ok"])
+        self.assertIn("Access is denied", result["message"])
+
+    def test_turning_off_keeps_the_running_panel_and_asks_permission_for_a_boot_task(self):
+        ok = self.autostart.disable(self.base, run=self.runner())
+        self.assertTrue(ok["ok"] and not ok["pending"])
+        self.assertIn("-KeepRunning", self.calls[0])
+        self.calls.clear()
+        denied = self.autostart.disable(self.base, run=self.runner(self.Result(1, "", "Access is denied"), self.Result()))
+        self.assertTrue(denied["ok"] and denied["pending"])
+        self.assertIn("RunAs", " ".join(self.calls[1]))
+
+    def test_scripts_are_found_next_to_the_exe_or_in_deploy(self):
+        a = self.autostart
+        self.assertEqual(a.find_script(self.base, "install_autostart.ps1"), os.path.join(self.base, "install_autostart.ps1"))
+        source = tempfile.mkdtemp()
+        os.makedirs(os.path.join(source, "deploy"))
+        with open(os.path.join(source, "deploy", "install_autostart.ps1"), "w") as f:
+            f.write("#")
+        self.assertEqual(a.find_script(source, "install_autostart.ps1"), os.path.join(source, "deploy", "install_autostart.ps1"))
+        self.assertIsNone(a.find_script(tempfile.mkdtemp(), "install_autostart.ps1"))
+
+
+class PackagedProgramCases(unittest.TestCase):
+    """The packaged exe is one file that runs as the panel, the reader or the COM test page."""
+
+    def test_entry_point_picks_the_mode_from_the_arguments(self):
+        import types
+        import janome_main
+        seen = []
+        fake_reader = types.SimpleNamespace(main=lambda argv: seen.append(("reader", argv)))
+        fake_app = types.SimpleNamespace(main=lambda: seen.append(("panel",)))
+        saved_argv, saved_modules = sys.argv, {k: sys.modules.get(k) for k in ("read_janome_jp4", "app")}
+        self.addCleanup(lambda: [sys.modules.__setitem__(k, v) if v is not None else sys.modules.pop(k, None) for k, v in saved_modules.items()])
+        self.addCleanup(setattr, sys, "argv", saved_argv)
+        sys.modules["read_janome_jp4"], sys.modules["app"] = fake_reader, fake_app
+        sys.argv = ["JanomeJP4.exe", "--reader", "--config", "c.json", "--mock"]
+        janome_main.run()
+        sys.argv = ["JanomeJP4.exe"]
+        janome_main.run()
+        self.assertEqual(seen, [("reader", ["--config", "c.json", "--mock"]), ("panel",)])
+
+
 class LocalFileCases(unittest.TestCase):
     """The local SQLite file keeps everything that was read, with or without a database server."""
 

@@ -178,6 +178,68 @@ document.addEventListener('DOMContentLoaded', () => {
     const csvModeEl = document.getElementById('CSV_MODE');
     if (csvModeEl) csvModeEl.addEventListener('change', updateCsvDayStart);
 
+    // Start with Windows: the scheduled task that starts the panel at login / at boot (see /api/autostart)
+    (function setupAutostart() {
+        const box = document.getElementById('autostart-box');
+        const statusEl = document.getElementById('autostart-status');
+        const noteEl = document.getElementById('autostart-note');
+        const buttons = {
+            Logon: document.getElementById('autostart-logon'),
+            Startup: document.getElementById('autostart-boot'),
+            off: document.getElementById('autostart-off'),
+        };
+        if (!box || !statusEl || !buttons.Logon || !buttons.Startup || !buttons.off) return;
+
+        function show(info) {
+            if (!info.supported) { box.hidden = true; return false; }
+            box.hidden = false;
+            const kind = { Logon: 'when you log in', Startup: 'when the computer starts' };
+            statusEl.textContent = info.installed ? `On: the panel starts ${kind[info.mode] || ''}.` : 'Off: the panel does not start by itself.';
+            Object.values(buttons).forEach(b => { b.disabled = !info.this_computer; });
+            buttons.off.disabled = !info.this_computer || !info.installed;
+            if (!info.this_computer) noteEl.textContent = 'Open the panel on the computer itself to change this.';
+            return info.installed;
+        }
+
+        async function refresh() {
+            try {
+                const res = await fetch('/api/autostart');
+                return show(await res.json());
+            } catch (err) { box.hidden = true; return false; }
+        }
+
+        // The administrator permission window is on the PC's screen; look for the result for a while
+        async function waitForChange(wasInstalled, wasMode) {
+            for (let i = 0; i < 30; i++) {
+                await new Promise(r => setTimeout(r, 2000));
+                const res = await fetch('/api/autostart');
+                const info = await res.json();
+                show(info);
+                if (info.installed !== wasInstalled || info.mode !== wasMode) return;
+            }
+            noteEl.textContent = 'No change yet. If you cancelled the permission window, nothing was changed.';
+        }
+
+        async function change(body) {
+            const before = await (await fetch('/api/autostart')).json();
+            noteEl.textContent = 'Working...';
+            try {
+                const res = await fetch('/api/autostart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                const data = await res.json();
+                noteEl.textContent = data.message || '';
+                if (data.pending) await waitForChange(before.installed, before.mode);
+                else await refresh();
+            } catch (err) {
+                noteEl.textContent = `Failed: ${err.message}`;
+            }
+        }
+
+        buttons.Logon.addEventListener('click', () => change({ action: 'enable', mode: 'Logon' }));
+        buttons.Startup.addEventListener('click', () => change({ action: 'enable', mode: 'Startup' }));
+        buttons.off.addEventListener('click', () => change({ action: 'disable' }));
+        refresh();
+    })();
+
     // Folder browser for the CSV folder: the panel lists this computer's folders (see /api/browse)
     (function setupFolderBrowser() {
         const folderInput = document.getElementById('CSV_FOLDER');

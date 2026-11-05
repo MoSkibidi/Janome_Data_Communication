@@ -24,12 +24,17 @@ import atexit
 import local_store
 import folder_browser
 import event_log
+import autostart
 from run_summary import RunSummary, restore_from_store
 
-app = Flask(__name__, template_folder='templates', static_folder='static')
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Built with PyInstaller (installer/): the program is JanomeJP4.exe, its templates and static files are unpacked
+# next to it in _internal (sys._MEIPASS), and the writable files (config, data, logs) stay beside the exe.
+FROZEN = bool(getattr(sys, 'frozen', False))
+RESOURCE_DIR = getattr(sys, '_MEIPASS', None) or os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(sys.executable)) if FROZEN else os.path.dirname(os.path.abspath(__file__))
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(__name__, template_folder=os.path.join(RESOURCE_DIR, 'templates'), static_folder=os.path.join(RESOURCE_DIR, 'static'))
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Writable runtime files (config, PID, state, log, SQLite DB) live in DATA_DIR.
 # Defaults to the project folder; set JANOME_DATA_DIR to a mounted volume in a container.
@@ -47,7 +52,7 @@ HEARTBEAT_PATH = os.path.join(DATA_DIR, '.janome_jp4_heartbeat.json')
 STOP_MARKER_PATH = os.path.join(DATA_DIR, '.janome_jp4_clean_stop')  # written by stop.bat: the stop is deliberate
 
 # Seed an empty data dir with the bundled config (its serial settings differ from the built-in defaults).
-_SEED_CONFIG = os.path.join(BASE_DIR, 'config.json')
+_SEED_CONFIG = os.path.join(RESOURCE_DIR, 'config.json')
 if not os.path.exists(CONFIG_PATH) and os.path.exists(_SEED_CONFIG):
     shutil.copyfile(_SEED_CONFIG, CONFIG_PATH)
 
@@ -453,10 +458,10 @@ def save_config():
 LOCAL_ADDRESSES = ('127.0.0.1', '::1', '::ffff:127.0.0.1')
 
 def local_request_only():
-    """Folder browsing shows this computer's folders, so it is only served to a browser on this computer."""
+    """Folder browsing and Start with Windows touch this computer, so they are only served to a browser on this computer."""
     if request.remote_addr in LOCAL_ADDRESSES:
         return None
-    return jsonify({'status': 'error', 'message': 'Folders can only be browsed from the computer the panel runs on.'}), 403
+    return jsonify({'status': 'error', 'message': 'This can only be done from the computer the panel runs on.'}), 403
 
 @app.route('/api/events')
 def api_events():
@@ -502,6 +507,32 @@ def api_browse_mkdir():
     except folder_browser.BrowseError as err:
         return jsonify({'status': 'error', 'message': str(err)}), 400
     return jsonify({'status': 'success', 'path': path})
+
+@app.route('/api/autostart', methods=['GET'])
+def api_autostart_status():
+    """Is the 'Start with Windows' scheduled task installed, and as which kind (Logon / Startup)?"""
+    info = autostart.status()
+    info['this_computer'] = local_request_only() is None  # the buttons only work from the PC that runs the panel
+    return jsonify(info)
+
+@app.route('/api/autostart', methods=['POST'])
+def api_autostart_change():
+    """Turns 'Start with Windows' on ({'action': 'enable', 'mode': 'Logon'|'Startup'}) or off ({'action': 'disable'})."""
+    refused = local_request_only()
+    if refused:
+        return refused
+    body = request.get_json(silent=True) or {}
+    if body.get('action') == 'disable':
+        result = autostart.disable(BASE_DIR)
+        panel_event('AUTOSTART', 'Start with Windows turned off.' if result['ok'] and not result['pending']
+                    else f"Turning off Start with Windows: {result['message']}", level='INFO' if result['ok'] else 'WARNING')
+    elif body.get('action') == 'enable':
+        result = autostart.enable(str(body.get('mode', '')), BASE_DIR)
+        panel_event('AUTOSTART', f"Start with Windows ({body.get('mode')}): {result['message']}",
+                    level='INFO' if result['ok'] else 'WARNING')
+    else:
+        return jsonify({'status': 'error', 'message': "action must be 'enable' or 'disable'"}), 400
+    return jsonify(dict(result, status='success' if result['ok'] else 'error')), (200 if result['ok'] else 400)
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
@@ -659,9 +690,10 @@ def launch_reader(run_mode, tolerate_db_down=False, fresh=True):
     global reader_proc, last_link
     write_desired_state(True, run_mode)
 
-    script_path = os.path.join(BASE_DIR, "read_janome_jp4.py")
-
-    cmd = [sys.executable, script_path, "--config", CONFIG_PATH]
+    if FROZEN:
+        cmd = [sys.executable, "--reader", "--config", CONFIG_PATH]  # the same exe, in reader mode (see janome_main.py)
+    else:
+        cmd = [sys.executable, os.path.join(BASE_DIR, "read_janome_jp4.py"), "--config", CONFIG_PATH]
     if run_mode == "mockup" or run_mode == "mock":
         cmd.append("--mock")
     if tolerate_db_down:
@@ -947,7 +979,7 @@ else:
 
 threading.Thread(target=supervise_reader, daemon=True).start()
 
-if __name__ == '__main__':
+def main():
     # Served on Port 8085 unless JANOME_HOST / JANOME_PORT override it
     socketio.run(
         app,
@@ -955,3 +987,7 @@ if __name__ == '__main__':
         port=int(os.environ.get('JANOME_PORT', '8085')),
         debug=False,
     )
+
+
+if __name__ == '__main__':
+    main()

@@ -1085,7 +1085,7 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
     return 0
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="JANOME Electro Press JP4 Data Ingestion and Database Service")
     parser.add_argument("--config", type=str, default="config.json", help="Path to config.json file")
     parser.add_argument("--interval", type=float, default=None, help="Override interval time in seconds between iterations")
@@ -1098,7 +1098,7 @@ if __name__ == "__main__":
     parser.add_argument("--run-id", type=int, default=None,
                         help="Run (in the local file) to add to; given by the panel, so the panel and the reader agree on the run")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     max_iter = 1 if args.once else None
     sys.exit(run_ingestion_loop(
@@ -1110,3 +1110,7 @@ if __name__ == "__main__":
         tolerate_db_down=args.tolerate_db_down,
         run_id=args.run_id,
     ))
+
+
+if __name__ == "__main__":
+    main()

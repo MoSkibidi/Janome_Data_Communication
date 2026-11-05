@@ -84,6 +84,32 @@ pip install -r requirements.txt
 
 A new PC starts clean: databases (`*.db`), `logs/` and the state files are not in git on purpose.
 
+### Packaged program (no Python on the target PC)
+
+`installer/` builds `JanomeJP4.exe` (one exe in one folder, about 32 MB, 16 MB zipped) that runs on a Windows 10/11
+64-bit PC with nothing installed but the USB/RS-232 driver. It is the same code: the exe is the panel, and when
+you press Start it starts itself again in reader mode (`JanomeJP4.exe --reader ...`).
+`JanomeJP4.exe --diagnostic` opens the COM test page on port 8086.
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File installer\build_windows.ps1
+```
+
+Run it on a PC that has Python 3.12 (x64) and internet access (first time only). It makes its own `installer\.build-venv`
+and writes `installer\dist\JanomeJP4\` and `installer\dist\JanomeJP4-Windows-x64.zip`; nothing else in the project changes.
+Install on the target PC: copy the folder to e.g. `C:\JanomeJP4` (a place the program can write to), install the adapter
+driver, double-click **`install.bat`** (one "Yes" on the administrator permission window): it makes the panel start when
+the computer starts, starts it now, puts a shortcut on the desktop and opens the panel. `uninstall.bat` undoes it.
+`README_INSTALL.txt` inside the folder says the same in short. `config.json` in the folder is a copy of the project's
+(including the database token): keep the folder private.
+
+### Start with Windows (from the panel)
+
+Settings > Startup > **Start with Windows**: *When I log in* needs no administrator rights; *When the computer starts*
+opens the normal Windows permission window on the PC's screen and the person there approves it (nothing is bypassed).
+*Turn off* removes the task and leaves the running panel alone. The buttons only work in a browser on the PC that runs
+the panel, not from another PC. It manages the scheduled task `JanomeJP4Panel` (`deploy/install_autostart.ps1`).
+
 ## Running
 
 **Diagnostic tool (recommended starting point):**

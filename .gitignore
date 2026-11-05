@@ -15,3 +15,8 @@ logs/
 janome_jp4_spool.db-journal
 .janome_jp4_heartbeat.json
 .janome_jp4_clean_stop
+
+# Packaged program build (installer/)
+installer/.build-venv/
+installer/build/
+installer/dist/
