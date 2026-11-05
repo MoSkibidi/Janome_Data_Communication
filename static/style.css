@@ -271,6 +271,12 @@ input:focus-visible, select:focus-visible, summary:focus-visible {
 .cycle-badges { display: inline-flex; gap: 8px; }
 .cycles-table tr.cycle-ng td { background: var(--danger-bg); color: var(--danger); font-weight: 600; }
 .cycles-table td:nth-child(2) { font-family: var(--font); }
+.cycle-badges { align-items: center; }
+.data-table.events-table th, .data-table.events-table td { font-family: var(--font); text-align: left; vertical-align: top; }
+.data-table.events-table td:nth-child(4), .data-table.events-table th:nth-child(4) { white-space: normal; min-width: 16rem; }
+.data-table.events-table td:nth-child(3) { font-family: var(--mono); font-size: 0.8125rem; }
+.data-table.events-table tr.event-error td { background: var(--danger-bg); color: var(--danger); }
+.data-table.events-table tr.event-warning td { background: var(--warn-bg); color: var(--warn); }
 .badge-finished { background: var(--surface-alt); border-color: var(--border-strong); color: var(--text); }
 
 .run-meta { font-size: 0.9375rem; color: var(--muted); margin-bottom: 12px; }
@@ -428,6 +434,25 @@ input::placeholder { color: #8a93a3; }
 .device-item:hover { background: var(--surface-alt); }
 .device-item .dev-name { font-weight: 600; }
 .device-item .dev-meta { font-size: 0.8125rem; color: var(--muted); }
+
+/* Folder browser (CSV folder setting) */
+.folder-browser {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+}
+.fb-head { display: flex; gap: 8px; flex-wrap: wrap; }
+.fb-head select { min-width: 0; }
+.fb-path { font-family: var(--mono); font-size: 0.8125rem; color: var(--muted); word-break: break-all; }
+.fb-list { max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+.fb-list .device-item { flex-direction: row; align-items: center; gap: 8px; padding: 8px 12px; }
+.fb-list .fb-empty { padding: 10px 12px; color: var(--muted); font-size: 0.875rem; }
+.fb-error { margin: 0; color: var(--danger); }
+.fb-actions { display: flex; gap: 8px; }
 
 .form-actions { padding-top: 16px; border-top: 1px solid var(--border); }
 .form-actions .btn { width: 100%; }

@@ -149,12 +149,134 @@ document.addEventListener('DOMContentLoaded', () => {
             if (autoStartCheck) autoStartCheck.checked = startup.auto_start_on_startup ?? data.AUTO_START_ON_STARTUP ?? false;
             if (autoStartModeSelect) autoStartModeSelect.value = startup.auto_start_mode || data.AUTO_START_MODE || 'mockup';
 
+            const csvCfg = data.csv_export || {};
+            const csvEnabled = document.getElementById('CSV_ENABLED');
+            const csvMode = document.getElementById('CSV_MODE');
+            const csvFolder = document.getElementById('CSV_FOLDER');
+            if (csvEnabled) csvEnabled.checked = csvCfg.enabled ?? true;
+            if (csvMode) csvMode.value = csvCfg.mode === 'day' ? 'day' : 'run';
+            if (csvFolder) csvFolder.value = csvCfg.folder || 'exports';
+            const csvDayStart = document.getElementById('CSV_DAY_START');
+            if (csvDayStart) csvDayStart.value = /^\d{1,2}:\d{2}/.test(csvCfg.day_start || '') ? csvCfg.day_start.slice(0, 5).padStart(5, '0') : '00:00';
+            updateCsvDayStart();
+            const csvEndLoad = document.getElementById('CSV_END_LOAD_SETTING');
+            if (csvEndLoad) csvEndLoad.value = csvCfg.end_load_setting_kgf ?? 250;
+
             updateDbFieldsVisibility();
             appendLog('[SYSTEM] Loaded configuration from server.');
         } catch (err) {
             appendLog(`[ERROR] Failed to load configuration: ${err.message}`, 'err');
         }
     }
+
+    // The day-start time only matters when a new file is made for every day
+    function updateCsvDayStart() {
+        const mode = document.getElementById('CSV_MODE');
+        const start = document.getElementById('CSV_DAY_START');
+        if (mode && start) start.disabled = mode.value !== 'day';
+    }
+    const csvModeEl = document.getElementById('CSV_MODE');
+    if (csvModeEl) csvModeEl.addEventListener('change', updateCsvDayStart);
+
+    // Folder browser for the CSV folder: the panel lists this computer's folders (see /api/browse)
+    (function setupFolderBrowser() {
+        const folderInput = document.getElementById('CSV_FOLDER');
+        const openBtn = document.getElementById('btn-browse-csv');
+        const panel = document.getElementById('folder-browser');
+        if (!folderInput || !openBtn || !panel) return;
+        const roots = document.getElementById('fb-roots');
+        const upBtn = document.getElementById('fb-up');
+        const newBtn = document.getElementById('fb-new');
+        const pathEl = document.getElementById('fb-path');
+        const listEl = document.getElementById('fb-list');
+        const errorEl = document.getElementById('fb-error');
+        let current = '';
+        let parent = '';
+        let homePath = '';
+
+        async function load(path) {
+            errorEl.textContent = '';
+            try {
+                const res = await fetch('/api/browse?path=' + encodeURIComponent(path || ''));
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    errorEl.textContent = data.message || 'This folder cannot be opened.';
+                    return;
+                }
+                current = data.path;
+                parent = data.parent;
+                homePath = data.home || '';
+                pathEl.textContent = data.path;
+                upBtn.disabled = !data.parent;
+                roots.innerHTML = '';
+                // The first entry is the user's home folder (where browsing starts), then the drives
+                const places = (homePath ? [{ value: homePath, label: 'Home' }] : [])
+                    .concat(data.roots.map(r => ({ value: r, label: r })));
+                places.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p.value;
+                    opt.textContent = p.label;
+                    roots.appendChild(opt);
+                });
+                const inHome = homePath && data.path.toLowerCase().startsWith(homePath.toLowerCase());
+                const here = inHome ? homePath : data.roots.find(r => data.path.toLowerCase().startsWith(r.toLowerCase()));
+                if (here) roots.value = here;
+                roots.classList.toggle('hidden', places.length < 2);
+                listEl.innerHTML = '';
+                if (!data.folders.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'fb-empty';
+                    empty.textContent = 'No sub-folders here.';
+                    listEl.appendChild(empty);
+                }
+                data.folders.forEach(f => {
+                    const row = document.createElement('div');
+                    row.className = 'device-item';
+                    row.textContent = f.name;  // textContent: a folder name is never treated as HTML
+                    row.addEventListener('click', () => load(f.path));
+                    listEl.appendChild(row);
+                });
+            } catch (err) {
+                errorEl.textContent = `Cannot list folders: ${err.message}`;
+            }
+        }
+
+        openBtn.addEventListener('click', () => {
+            if (panel.classList.contains('hidden')) {
+                panel.classList.remove('hidden');
+                // Start at the folder already chosen if it is a full path, otherwise at the home folder
+                const typed = folderInput.value.trim();
+                const full = /^([A-Za-z]:[\\/]|\\\\|\/|~)/.test(typed);
+                load(full ? typed : '');
+            } else {
+                panel.classList.add('hidden');
+            }
+        });
+        roots.addEventListener('change', () => load(roots.value));
+        upBtn.addEventListener('click', () => { if (parent) load(parent); });
+        newBtn.addEventListener('click', async () => {
+            const name = window.prompt('Name of the new folder (created inside the folder shown)');
+            if (!name) return;
+            errorEl.textContent = '';
+            try {
+                const res = await fetch('/api/browse/mkdir', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ parent: current, name })
+                });
+                const data = await res.json();
+                if (data.status === 'success') load(data.path);
+                else errorEl.textContent = data.message || 'Cannot create the folder.';
+            } catch (err) {
+                errorEl.textContent = `Cannot create the folder: ${err.message}`;
+            }
+        });
+        document.getElementById('fb-select').addEventListener('click', () => {
+            if (current) folderInput.value = current;
+            panel.classList.add('hidden');
+        });
+        document.getElementById('fb-cancel').addEventListener('click', () => panel.classList.add('hidden'));
+    })();
 
     // Save Configuration to API
     configForm.addEventListener('submit', async (e) => {
@@ -178,8 +300,23 @@ document.addEventListener('DOMContentLoaded', () => {
             }),
             acquisition: {
                 interval_time: parseFloat(acqInterval.value)
-            }
+            },
         };
+        // the CSV section is missing if the page is an older cached copy; then leave the saved setting alone
+        const csvEnabledBox = document.getElementById('CSV_ENABLED');
+        const csvModeSelect = document.getElementById('CSV_MODE');
+        const csvFolderInput = document.getElementById('CSV_FOLDER');
+        if (csvEnabledBox && csvModeSelect && csvFolderInput) {
+            payload.csv_export = {
+                enabled: csvEnabledBox.checked,
+                mode: csvModeSelect.value,
+                folder: csvFolderInput.value.trim() || 'exports'
+            };
+            const csvDayStartInput = document.getElementById('CSV_DAY_START');
+            if (csvDayStartInput) payload.csv_export.day_start = csvDayStartInput.value || '00:00';
+            const csvEndLoadInput = document.getElementById('CSV_END_LOAD_SETTING');
+            if (csvEndLoadInput && csvEndLoadInput.value !== '') payload.csv_export.end_load_setting_kgf = parseFloat(csvEndLoadInput.value);
+        }
 
         try {
             const res = await fetch('/api/config', {
@@ -532,6 +669,61 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // ---------- Event (error) log ----------
+    // The card is missing if the page is an older cached copy; everything here is null-safe.
+    const elEventsBody = document.getElementById('events-body');
+    const elEventsNote = document.getElementById('events-note');
+    const elEventsProblems = document.getElementById('events-problems');
+    const MAX_EVENT_ROWS = 200;
+
+    function parseEventLine(line) {
+        const parts = line.split(' | ');
+        if (parts.length < 4) return null;
+        return { time: parts[0].trim(), level: parts[1].trim(), code: parts[2].trim(),
+                 message: parts[3].trim(), details: (parts[4] || '').trim() };
+    }
+
+    function eventRow(ev) {
+        const tr = document.createElement('tr');
+        tr.className = `event-${ev.level.toLowerCase()}`;
+        const cells = [ev.time.slice(5), ev.level, ev.code, ev.details ? `${ev.message} (${ev.details})` : ev.message];
+        cells.forEach(text => {
+            const td = document.createElement('td');
+            td.textContent = text;
+            tr.appendChild(td);
+        });
+        return tr;
+    }
+
+    function addEventRow(ev) {
+        if (!elEventsBody) return;
+        if (elEventsProblems && elEventsProblems.checked && ev.level === 'INFO') return;
+        elEventsBody.insertBefore(eventRow(ev), elEventsBody.firstChild);
+        while (elEventsBody.childElementCount > MAX_EVENT_ROWS) elEventsBody.removeChild(elEventsBody.lastChild);
+        elEventsNote.textContent = `Showing the latest ${elEventsBody.childElementCount} event(s), newest first.`;
+    }
+
+    async function loadEvents() {
+        if (!elEventsBody) return;
+        try {
+            const level = elEventsProblems && elEventsProblems.checked ? '&level=WARNING' : '';
+            const res = await fetch('/api/events?limit=' + MAX_EVENT_ROWS + level);
+            const data = await res.json();
+            elEventsBody.innerHTML = '';
+            data.events.forEach(ev => elEventsBody.insertBefore(eventRow(ev), elEventsBody.firstChild));
+            elEventsNote.textContent = data.events.length
+                ? `Showing the latest ${data.events.length} event(s), newest first.` : 'No events yet.';
+        } catch (err) {
+            elEventsNote.textContent = `Could not load events: ${err.message}`;
+        }
+    }
+
+    if (elEventsProblems) elEventsProblems.addEventListener('change', loadEvents);
+    socket.on('event_update', (data) => {
+        const ev = data && data.line ? parseEventLine(data.line) : null;
+        if (ev) addEventRow(ev);
+    });
+
     elSamplesDetails.addEventListener('toggle', () => { if (elSamplesDetails.open) loadSamples(); });
     btnRefreshSamples.addEventListener('click', loadSamples);
     // While a run is going and the table is open, keep it current
@@ -590,4 +782,5 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initial config load
     loadConfig();
     loadCycles();
+    loadEvents();
 });

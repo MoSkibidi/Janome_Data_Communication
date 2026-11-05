@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 venv/
 *.db
+*.db-wal
+*.db-shm
+exports/
 *.log
 .janome_jp4_process.pid
 .janome_jp4_process.mode
@@ -10,3 +13,4 @@ venv/
 last_monitor_session.json
 logs/
 janome_jp4_spool.db-journal
+.janome_jp4_heartbeat.json

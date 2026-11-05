@@ -8,7 +8,9 @@ import argparse
 import logging
 import datetime
 import local_store
-from database_handler import DatabaseHandler, BufferedDatabaseWriter, DiskSpool
+import csv_export
+import event_log
+from database_handler import DatabaseHandler, BufferedDatabaseWriter, DiskSpool, classify_db_error
 
 # Ensure UTF-8 output encoding on Windows consoles to prevent UnicodeEncodeError
 if hasattr(sys.stdout, 'reconfigure'):
@@ -82,16 +84,37 @@ def decode_quality_frame(data):
         "lifetime_total": int(data[20:28], 16),
         "sensor_fault_section": int(data[32:36], 16),
         "sensor_fault_number": int(data[36:40], 16),
+        # The undecoded frame: the whole data field and what follows the fixed 88-character header
+        # (sensor sampling data of variable length, not decoded yet). The cycle handler drops both
+        # before the cycle is logged or saved.
+        "v1_raw": data,
+        "v1_extra": data[88:],
     }
+
+
+# Program settings readable with S2 (Data Request), from the item table of the COM manual:
+# name -> (item number, unit, scale, section level). "head" items use pressing section 0.
+S2_SETTINGS = {
+    # Item numbers confirmed on a real press (program 5, values matched the press screen and varied
+    # per program): 2006 pressing speed, 2005 start position, 2017 end position. The manual lists the
+    # start position as 1510, but that item reads 0 on this press. The return speed is item 2030, one
+    # of two head speed items (the other, 2002, is the approach speed); confirm against the screen of a
+    # program whose approach and return speeds differ.
+    "set_pressing_speed_mm_s": (2006, 0.001, "pressing"),
+    "set_return_speed_mm_s": (2030, 0.001, "head"),
+    "set_start_position_mm": (2005, 0.0001, "head"),
+    "set_end_position_mm": (2017, 0.0001, "pressing"),
+}
+IO_TYPES = (("io_system_in", 0), ("io_general_in", 1), ("io_system_out", 2), ("io_general_out", 3))
 
 
 class JanomeJP4Press:
     def __init__(self, port, baudrate=38400, timeout=2.0):
         """
         Initializes serial connection to a JANOME Electro Press (JP4).
-        Link settings confirmed against real hardware: 38400 bps (this
-        press's actual configured rate, not the manual's 9600 default),
-        8 data bits, no parity, 1 stop bit.
+        Link settings confirmed against real hardware: 8 data bits, no parity,
+        1 stop bit. The baud rate is configured on the press itself (one unit
+        runs at 38400 bps, another at the manual's 9600 default), so it comes from config.json.
         """
         self.port = port
         self.timeout = timeout
@@ -307,7 +330,39 @@ class JanomeJP4Press:
             info["press_type"] = press_type_map.get(data[0:1], data[0:1])
         except Exception:
             pass
+        if len(data) >= 30:  # field layout as decoded by serial_test_webapp.decode_b0
+            info["model_type"] = {"0": "Stand-Alone/Head Type", "1": "Unit Type"}.get(data[0:2], data[0:2])
+            info["load_spec_code"] = data[4:6]
+            info["ram_length_code"] = data[8:10]
+            info["sw_version"] = f"Ver. {int(data[16:20], 16) / 100:.2f}"
+            info["custom_number"] = data[24:28]
+            info["teaching_version"] = data[28:30]
         return info
+
+    def read_io_status(self, io_type):
+        """
+        Reads the ON/OFF bit map of one I/O type with K0 (0 system in, 1 general in, 2 system out,
+        3 general out). Returns the bit map as the press sends it, as hex text.
+        """
+        resp = self.send_command('K', '0', f"{io_type:04X}")
+        return resp["data"][4:].upper()
+
+    def read_program_settings(self, program, pressing_section=1):
+        """
+        Reads the settings of a program with S2 (Data Request): pressing speed, start position, end
+        position and end load of the given pressing section. Returns {name: value}; a value the press
+        refuses (FFFF) is None. Stops at the first communication failure (the exception is raised).
+        """
+        values = {}
+        for name, (item, scale, level) in S2_SETTINGS.items():
+            section = 0 if level == "head" else pressing_section
+            resp = self.send_command('S', '2', f"{program:04X}{section:04X}{0:04X}{item:04X}")
+            data = resp["data"]
+            if data[0:4].upper() == "FFFF":
+                values[name] = None
+            else:
+                values[name] = round(self._hex_to_signed(data[4:12]) * scale, 4)
+        return values
 
     def read_telemetry(self):
         """
@@ -371,8 +426,20 @@ class MockJanomeJP4Press:
             "sensor_fault_section": 0,
             "sensor_fault_number": 0,
             "backlog": False,
+            "v1_raw": "MOCK" + "0" * 84,
+            "v1_extra": "",
         }
         return [(datetime.datetime.now(datetime.timezone.utc), cycle)]
+
+    def read_system_info(self):
+        return {"raw": "MOCK", "press_type": "MOCK", "sw_version": "Ver. 0.00"}
+
+    def read_io_status(self, io_type):
+        return f"{0x10 + io_type:02X}0000"
+
+    def read_program_settings(self, program, pressing_section=1):
+        return {"set_pressing_speed_mm_s": 100.0, "set_return_speed_mm_s": 80.0,
+                "set_start_position_mm": 29.0, "set_end_position_mm": 37.814}
 
     def read_telemetry(self):
         import random
@@ -474,20 +541,52 @@ class PressSession:
     FAILS_BEFORE_DOWN = 3  # consecutive failed polls before the link is reported as no_response
     REOPEN_EVERY = 5       # failed polls after which the port is closed and opened again
 
-    def __init__(self, open_press, reconnect_interval=5.0):
+    def __init__(self, open_press, reconnect_interval=5.0, label=""):
         self.open_press = open_press  # returns an opened press object, raises if the port cannot be opened
         self.reconnect_interval = reconnect_interval
+        self.label = label  # port name, for the event log
         self.press = None
         self.state = None
         self.fail_streak = 0
         self.next_open_at = 0.0
+        self.down_since = None  # when the link first went wrong (monotonic), until it is up again
 
     def _set_state(self, state, detail=""):
         if state == self.state:
             return
+        previous = self.state
         self.state = state
         print(f"[LINK] state={state} detail={detail}")
         sys.stdout.flush()
+        self._report(previous, state, detail)
+
+    def _report(self, previous, state, detail):
+        """One event-log line per link change (fail cases 1 and 3)."""
+        port = self.label or "serial port"
+        if state == "up":
+            if previous in ("port_unavailable", "no_response") and self.down_since is not None:
+                down = event_log.describe_duration(time.monotonic() - self.down_since)
+                if previous == "port_unavailable":
+                    event_log.emit("RS232_RECOVERED", f"RS-232 port {port} is back and the press answers; reading continues "
+                                   f"automatically (link was down {down}).", port=self.label or None, down_for=down)
+                else:
+                    event_log.emit("PRESS_RECOVERED", f"The press answers again on {port} (power back on or cable "
+                                   f"reconnected); reading and cycle results continue automatically (link was down {down}).",
+                                   port=self.label or None, down_for=down)
+            else:
+                event_log.emit("PRESS_CONNECTED", f"Connected to the press on {port}.", port=self.label or None)
+            self.down_since = None
+            return
+        if self.down_since is None:
+            self.down_since = time.monotonic()
+        if state == "port_unavailable":
+            event_log.emit("RS232_LOST", f"RS-232 port {port} is not available (adapter unplugged or port busy). "
+                           f"Auto-reconnect: opening it again every {self.reconnect_interval:g} s.",
+                           level="ERROR", port=self.label or None, reason=detail)
+        elif state == "no_response":
+            event_log.emit("PRESS_NO_RESPONSE", f"The press does not answer on {port}: powered off, RS-232 cable pulled "
+                           f"or wrong baud rate. Auto-reconnect: still polling; reading resumes by itself.",
+                           level="ERROR", port=self.label or None, reason=detail)
 
     def _drop_port(self):
         if self.press is not None:
@@ -569,12 +668,36 @@ def describe_db(db_cfg, db_type):
     return f"{db_type} database '{db_cfg.get('db_name')}' at {db_cfg.get('host')}:{db_cfg.get('port')}"
 
 
-def make_cycle_handler(writer, keep_local=None):
+STOP_RESULT_CODES = (3229, 3232, 3233)  # the cycle was stopped before it finished (stop signal / emergency stop)
+
+
+def make_cycle_handler(writer, keep_local=None, last_total=None):
     """
-    Returns a function that logs finished cycles ([CYCLE] line, [NG] warning), queues them for
-    the database and, through keep_local(kind, when, data), saves them in the local file.
+    Returns a function that logs finished cycles ([CYCLE] line, NG events), queues them for
+    the database and, through keep_local(kind, when, data), saves them in the local file and CSV.
+    last_total is the press cycle counter (lifetime_total) of the last saved cycle, if known:
+    every result is checked against it so a missing cycle shows up as a CYCLE_GAP event.
     """
     last_time = [None]
+    counter = [last_total]
+
+    def check_counter(cycle):
+        total = cycle.get("lifetime_total")
+        if total is None:
+            return
+        before = counter[0]
+        counter[0] = total
+        if before is None:
+            return
+        if total > before + 1:
+            event_log.emit("CYCLE_GAP", f"{total - before - 1} stamping cycle(s) are missing: the press counter went from "
+                           f"{before} to {total}. They happened while this program was not reading (PC off, link down "
+                           f"longer than the press keeps results).", level="WARNING",
+                           missing=total - before - 1, counter_from=before, counter_to=total)
+        elif total <= before:
+            event_log.emit("CYCLE_COUNTER_RESET", f"The press cycle counter went from {before} to {total} "
+                           f"(counter reset, another press, or a repeated result).", level="WARNING",
+                           counter_from=before, counter_to=total)
 
     def handle(cycles):
         for received_at, cycle in cycles:
@@ -582,12 +705,26 @@ def make_cycle_handler(writer, keep_local=None):
                 # a burst of queued frames must not share one timestamp (InfluxDB would overwrite)
                 received_at = last_time[0] + datetime.timedelta(microseconds=1)
             last_time[0] = received_at
+            # the undecoded frame is not part of the cycle record (log line, database, local file, CSV)
+            for key in ("v1_raw", "v1_extra"):
+                cycle.pop(key, None)
             print(f"[CYCLE] {json.dumps(dict(cycle, time=received_at.isoformat()))}")
+            check_counter(cycle)
             if not cycle["ok"]:
                 logger.warning(
                     f"[NG] Cycle result {cycle['result_code']} ({cycle['result_text']}): "
                     f"end {cycle['end_position_mm']} mm / {cycle['end_load_n']} N, "
                     f"{cycle['fault_total']} fault cycle(s) so far."
+                )
+                stopped = cycle["result_code"] in STOP_RESULT_CODES
+                event_log.emit(
+                    "PRESS_NG",
+                    f"Press reported NG: result {cycle['result_code']} ({cycle['result_text']})"
+                    + (", the stroke was stopped before it finished (emergency stop / stop signal)" if stopped else "")
+                    + ". The NG record is saved to the local file, CSV and the database.",
+                    level="WARNING", program=cycle.get("program_number"), result_code=cycle["result_code"],
+                    end_position_mm=cycle.get("end_position_mm"), end_load_n=cycle.get("end_load_n"),
+                    fault_total=cycle.get("fault_total"), backlog=1 if cycle.get("backlog") else None,
                 )
             if keep_local:
                 keep_local("cycle", received_at, cycle)
@@ -616,6 +753,7 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
     database is configured, so the data is on this computer even while the database server is down.
     """
     config = load_config(config_path)
+    event_log.configure(event_log.default_path(config_path))
 
     serial_cfg = config.get("serial", {})
     db_cfg = config.get("database", {})
@@ -642,6 +780,26 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
     local_enabled = local_cfg.get("enabled", True)
     local_path = local_store.resolve_path(local_cfg, config_path)
     print(f"  Local file:    {local_path if local_enabled else 'OFF (nothing is kept on this computer)'}")
+    csv_cfg = config.get("csv_export", {})
+    csv_enabled = csv_cfg.get("enabled", True)
+    csv_mode = str(csv_cfg.get("mode") or "run").lower()
+    if csv_mode not in csv_export.MODES:
+        logger.warning(f"[CSV] Unknown csv_export mode '{csv_mode}'; using 'run'.")
+        csv_mode = "run"
+    csv_folder = csv_export.resolve_folder(csv_cfg, config_path)
+    try:
+        csv_day_start = csv_export.parse_day_start(csv_cfg.get("day_start"))
+    except (ValueError, TypeError) as err:
+        logger.warning(f"[CSV] Bad csv_export day_start ({err}); the day changes at 00:00.")
+        csv_day_start = (0, 0)
+    csv_day_start_text = f"{csv_day_start[0]:02d}:{csv_day_start[1]:02d}"
+    # Target of the cycle report (not stored in the press): the end load setting in kg
+    csv_targets = {"end_load_setting_kgf": csv_cfg.get("end_load_setting_kgf", 250)}
+    if csv_enabled:
+        print(f"  Cycle CSV:     {csv_folder} (one file per "
+              f"{'Start-Stop run' if csv_mode == 'run' else 'day, the day changes at ' + csv_day_start_text})")
+    else:
+        print("  Cycle CSV:     OFF")
     if log_only:
         print("  Database:      NONE (data is kept in the local file only)")
     else:
@@ -674,6 +832,8 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                 if spool.count == 0 and not tolerate_db_down:
                     logger.error(f"[DB ERROR] Cannot connect to {where}: {err}")
                     logger.error("[DB ERROR] Ingestion not started. Fix the database settings or set the database to 'This computer only'.")
+                    event_log.emit("DB_UNREACHABLE", f"Cannot connect to {where}: {err}. Reading was not started; fix the "
+                                   f"database setting (or use 'This computer only') and press Start.", level="ERROR")
                     spool.close()
                     return 2
                 # Keep collecting and send everything once the DB is back (earlier samples on disk, or an automatic restart)
@@ -681,6 +841,9 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                 if spool.count:
                     logger.warning(f"[DB] {spool.count} sample(s) from an earlier run are waiting in '{spool_path}'.")
                 logger.warning("[DB] Starting anyway; samples are spooled to disk until the database is reachable.")
+                event_log.emit(classify_db_error(err), f"Cannot connect to {where}: {err}. Reading starts anyway; data is "
+                               f"stored at the edge (local file + disk spool) and sent when the database is back.",
+                               level="ERROR")
                 db_handler = DatabaseHandler(db_cfg, connect=False)
                 db_connected = False
             else:
@@ -705,8 +868,62 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                 logger.warning(f"[LOCAL] Cannot open the local file '{local_path}': {err}. Continuing without it.")
         local_failures = [0]
 
+        run_started = None
+        if local is not None and run_id is not None:
+            try:
+                row = local.get_run(run_id)
+                if row:
+                    run_started = datetime.datetime.fromisoformat(row["started_at"])
+            except Exception:
+                run_started = None
+        exporter = None
+        if csv_enabled:
+            try:
+                exporter = csv_export.CsvExporter(csv_folder, csv_mode, run_started=run_started, run_id=run_id,
+                                              day_start=csv_day_start_text)
+            except Exception as err:
+                logger.warning(f"[CSV] Cannot use the folder '{csv_folder}': {err}. Continuing without CSV files.")
+                exporter = None
+        csv_failures = [0]
+        settings_state = {"cache": {}, "failures": 0}
+
+        def note_extra_failure(what, err):
+            """Reading the program settings for the CSV is best effort: log the first problems, never stop."""
+            settings_state["failures"] += 1
+            if settings_state["failures"] in (1, 100, 10000):
+                logger.warning(f"[CSV] Extra read failed: {what} ({err}); {settings_state['failures']} time(s) so far.")
+
+        def settings_for(program):
+            """Program settings (S2), cached per program so a burst of cycles does not read them again."""
+            now = time.monotonic()
+            cached = settings_state["cache"].get(program)
+            if cached and now < cached[0]:
+                return cached[1]
+            press = session.press if session else None
+            values = {}
+            if press is not None:
+                try:
+                    values = press.read_program_settings(program)
+                except Exception as err:
+                    note_extra_failure("reading the program settings", err)
+            settings_state["cache"][program] = (now + (300 if values else 30), values)
+            return values
+
+        def keep_csv(when, cycle):
+            """Appends one finished cycle to the CSV file; a problem here never stops the collection."""
+            if exporter is None:
+                return
+            try:
+                exporter.add_cycle(when, cycle, settings_for(cycle.get("program_number")), csv_targets)
+            except Exception as err:
+                csv_failures[0] += 1
+                if csv_failures[0] in (1, 100, 10000):
+                    logger.warning(f"[CSV] Could not write the CSV file ({err}); {csv_failures[0]} failure(s) so far.")
+
         def keep_local(kind, when, data):
-            """Saves one reading or cycle in the local file; a problem here never stops the collection."""
+            """Saves one reading or cycle in the local file and CSV; a problem here never stops the collection."""
+            if kind == "cycle":
+                keep_csv(when, data)
             if local is None:
                 return
             try:
@@ -720,10 +937,21 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                     logger.warning(f"[LOCAL] Could not save to the local file ({err}); {local_failures[0]} failure(s) so far.")
 
         if mock_mode:
-            session = PressSession(lambda: MockJanomeJP4Press(port="MOCK", baudrate=baudrate, timeout=timeout), reconnect_interval)
+            session = PressSession(lambda: MockJanomeJP4Press(port="MOCK", baudrate=baudrate, timeout=timeout), reconnect_interval, label="MOCK")
         else:
-            session = PressSession(lambda: JanomeJP4Press(port=port, baudrate=baudrate, timeout=timeout), reconnect_interval)
-        handle_cycles = make_cycle_handler(writer, keep_local)
+            session = PressSession(lambda: JanomeJP4Press(port=port, baudrate=baudrate, timeout=timeout), reconnect_interval, label=port)
+        last_total = None
+        if local is not None:
+            try:
+                last_total = local.last_lifetime_total("mock" if mock_mode else "real")
+            except Exception as err:
+                logger.warning(f"[LOCAL] Could not read the last cycle counter: {err}")
+        handle_cycles = make_cycle_handler(writer, keep_local, last_total)
+        event_log.emit("READER_START",
+                       f"Reader started ({'automatic start, no operator' if tolerate_db_down else 'manual start'}): "
+                       f"{'MOCK simulation' if mock_mode else 'press on ' + str(port) + ' @ ' + str(baudrate) + ' bps'}; "
+                       f"data goes to {'the local file only' if log_only else describe_db(db_cfg, db_type)}.",
+                       run_id=run_id, mode="mock" if mock_mode else "real")
 
         iteration = 0
         print(f"\nStarting data collection loop (interval: {interval_time}s). Press Ctrl+C to stop.\n")
@@ -783,8 +1011,11 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
 
     except KeyboardInterrupt:
         print("\n[STOP] Ingestion loop stopped by user (KeyboardInterrupt). Exiting...")
+        event_log.emit("READER_STOP", "Reader stopped (Ctrl+C or stop request).", run_id=run_id)
     except Exception as err:
         logger.error(f"Service encountered an error: {err}")
+        event_log.emit("READER_ERROR", f"The reader stopped because of an error: {err}. The panel restarts it "
+                       f"automatically if the run should still be going.", level="ERROR", run_id=run_id)
         return 1
     finally:
         if session:

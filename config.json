@@ -6,8 +6,8 @@
   "AUTO_START_ON_STARTUP": false,
   "AUTO_START_MODE": "real",
   "serial": {
-    "port": "COM3",
-    "baudrate": 38400,
+    "port": "COM7",
+    "baudrate": 9600,
     "timeout": 2
   },
   "database": {
@@ -31,5 +31,11 @@
   },
   "acquisition": {
     "interval_time": 1
+  },
+  "csv_export": {
+    "enabled": true,
+    "mode": "day",
+    "folder": "C:\\Apps\\Janome_Data_Communication\\Test",
+    "end_load_setting_kgf": 250
   }
 }

@@ -120,6 +120,20 @@ class LocalStore:
             self.conn.execute("INSERT INTO cycles (run_id, ts, payload) VALUES (?, ?, ?)",
                               (run_id, when.isoformat(), json.dumps(dict(cycle, time=when.isoformat()))))
 
+    def last_lifetime_total(self, mode=None):
+        """Press cycle counter (lifetime_total) of the newest saved cycle of runs in `mode`, or None."""
+        sql = "SELECT c.payload FROM cycles c JOIN runs r ON r.id = c.run_id"
+        args = ()
+        if mode is not None:
+            sql += " WHERE r.mode = ?"
+            args = (mode,)
+        with self._lock:
+            row = self.conn.execute(sql + " ORDER BY c.id DESC LIMIT 1", args).fetchone()
+        try:
+            return json.loads(row[0]).get("lifetime_total") if row else None
+        except (ValueError, AttributeError):
+            return None
+
     def count_samples(self, run_id=None):
         with self._lock:
             if run_id is None:

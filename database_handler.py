@@ -12,7 +12,19 @@ import urllib.parse
 import urllib.request
 from collections import deque
 
+import event_log
+
 logger = logging.getLogger(__name__)
+
+# Words a full disk / full database leaves in an error message (InfluxDB answers 500/507 with them).
+_DISK_FULL_HINTS = ("no space", "disk full", "disk is full", "out of space", "not enough space",
+                    "insufficient storage", "quota", "http 507")
+
+
+def classify_db_error(err):
+    """Event code for a database error: DB_FULL when the server is out of space, else DB_UNREACHABLE."""
+    text = str(err).lower()
+    return "DB_FULL" if any(hint in text for hint in _DISK_FULL_HINTS) else "DB_UNREACHABLE"
 
 # Per-cycle ("quality data") record: one row per press stroke, OK or NG.
 # (column name, kind) - kind decides the SQL type; InfluxDB uses the same names as fields.
@@ -462,6 +474,8 @@ class DatabaseHandler:
                     self._influx_write([line])
                 return
             logger.error(f"[DB] InfluxDB rejected a sample (HTTP {status}: {self._influx_message(body)}); dropped: {lines[0][:120]}")
+            event_log.emit("DB_REJECTED", f"InfluxDB rejected a record (HTTP {status}: {self._influx_message(body)}); that record "
+                           f"was dropped, the others are not blocked.", level="ERROR", record=lines[0][:80])
             return
         raise Exception(f"InfluxDB HTTP {status}: {self._influx_message(body)}")
 
@@ -495,6 +509,8 @@ class DatabaseHandler:
             self._influx_apply_retention()
         except Exception as err:
             logger.warning(f"[DB] Could not apply the InfluxDB retention setting: {err}")
+            event_log.emit("DB_RETENTION", f"Could not apply the InfluxDB retention setting: {err}. Set it in the "
+                           f"InfluxDB UI, or old data will not be deleted automatically.", level="WARNING")
 
     def _influx_apply_retention(self):
         """
@@ -523,6 +539,8 @@ class DatabaseHandler:
                 if a_status != 200:
                     raise Exception(f"HTTP {a_status}: {self._influx_message(a_body)}")
                 logger.info(f"[DB] InfluxDB retention of '{target}' set to {days} day(s).")
+                event_log.emit("DB_RETENTION", f"InfluxDB retention of '{target}' set to {days} day(s): older data is "
+                               f"deleted by InfluxDB itself, so the disk does not fill up.", database=target, days=days)
             return
 
         q = urllib.parse.urlencode({"name": target, "org": self.config.get("influx_org") or ""})
@@ -541,6 +559,8 @@ class DatabaseHandler:
         if p_status != 200:
             raise Exception(f"HTTP {p_status}: {self._influx_message(p_body)}")
         logger.info(f"[DB] InfluxDB retention of bucket '{target}' set to {days} day(s).")
+        event_log.emit("DB_RETENTION", f"InfluxDB retention of bucket '{target}' set to {days} day(s): older data is "
+                       f"deleted by InfluxDB itself, so the disk does not fill up.", bucket=target, days=days)
 
     def close(self):
         """Closes the database connection cleanly."""
@@ -629,6 +649,7 @@ class BufferedDatabaseWriter:
         self.written = 0
         self.db_errors = 0
         self.dropped = 0
+        self._down_since = None if connected else time.monotonic()
 
         self._buffer = deque()
         self._cond = threading.Condition()
@@ -656,6 +677,9 @@ class BufferedDatabaseWriter:
         self.dropped += n
         if before == 0 or self.dropped // 1000 > before // 1000:
             logger.warning(f"[DB] Dropped {self.dropped} oldest sample(s) because the buffer/spool limit was reached.")
+            event_log.emit("DATA_DROPPED", f"{self.dropped} oldest sample(s) were dropped from the edge buffer because its "
+                           f"limit was reached (the database has been unreachable too long). They remain in the local file.",
+                           level="ERROR", dropped=self.dropped)
 
     def _spill(self):
         """Moves the in-memory queue to disk; keeps it in memory if the disk write fails."""
@@ -668,6 +692,8 @@ class BufferedDatabaseWriter:
             discarded = self.spool.append(items)
         except Exception as err:
             logger.error(f"[DB] Could not write {len(items)} sample(s) to the disk spool ({err}); keeping them in memory.")
+            event_log.emit("DATA_DROPPED", f"Could not write {len(items)} sample(s) to the edge disk spool ({err}); they are "
+                           f"kept in memory only. Check the free space of this computer's disk.", level="ERROR")
             with self._cond:
                 self._buffer.extendleft(reversed(items))
             return
@@ -678,7 +704,13 @@ class BufferedDatabaseWriter:
         self.db_errors += 1
         self.connected = False
         next_retry[0] = time.monotonic() + self.retry_interval
+        self._down_since = self._down_since or time.monotonic()
         logger.warning(f"[DB] Database unavailable ({err}); spooling samples to disk until it is back.")
+        code = classify_db_error(err)
+        what = ("The database is full (no space left)" if code == "DB_FULL"
+                else "The database/network is unreachable")
+        event_log.emit(code, f"{what} ({err}). Data is stored at the edge (local file + disk spool) and synced "
+                       f"automatically, oldest first, when it is back.", level="ERROR", waiting=self.pending)
 
     def _run(self):
         next_retry = [0.0]
@@ -709,6 +741,10 @@ class BufferedDatabaseWriter:
                     continue
                 self.connected = True
                 logger.info(f"[DB] Connection restored; sending {self.pending} waiting sample(s).")
+                event_log.emit("DB_RESTORED", f"The database is reachable again after "
+                               f"{event_log.describe_duration(time.monotonic() - (self._down_since or time.monotonic()))}; "
+                               f"syncing {self.pending} waiting sample(s), oldest first.", waiting=self.pending)
+                self._down_since = None
 
             # Connected: oldest first, so replay the disk spool before the in-memory queue
             if self.spool.count:
@@ -747,5 +783,7 @@ class BufferedDatabaseWriter:
         left = self.spool.count
         if left:
             logger.warning(f"[DB] {left} sample(s) not yet in the database were kept in '{self.spool.path}' and will be sent on the next start.")
+            event_log.emit("DB_UNREACHABLE", f"{left} sample(s) not yet in the database were kept in '{self.spool.path}' and "
+                           f"will be sent on the next start.", level="WARNING", waiting=left)
         self.spool.close()
         self.handler.close()

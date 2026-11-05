@@ -136,6 +136,30 @@
                 <p class="note" id="cycles-note">No cycles yet.</p>
             </section>
 
+            <!-- Event (error) log: kept in logs/events.log, survives Stop/Start, crashes and reboots -->
+            <section class="card" aria-labelledby="events-title">
+                <div class="card-head">
+                    <h2 id="events-title">Event log</h2>
+                    <span class="cycle-badges">
+                        <label class="check" for="events-problems">
+                            <input type="checkbox" id="events-problems">
+                            <span>Problems only</span>
+                        </label>
+                        <a class="btn-link" href="/api/events/download" download="events.log">Download</a>
+                    </span>
+                </div>
+                <p class="run-meta">Cable pulled, press off, NG / emergency stop, database or network down, program restarted by itself. Saved in logs/events.log, which is never cleared by Start.</p>
+                <div class="table-wrap samples-scroll">
+                    <table class="data-table events-table">
+                        <thead>
+                            <tr><th scope="col">Time</th><th scope="col">Level</th><th scope="col">Event</th><th scope="col">What happened</th></tr>
+                        </thead>
+                        <tbody id="events-body"></tbody>
+                    </table>
+                </div>
+                <p class="note" id="events-note">No events yet.</p>
+            </section>
+
             <!-- Log -->
             <section class="card log-card" aria-labelledby="log-title">
                 <div class="log-header">
@@ -300,6 +324,54 @@
                                 <option value="real">Read from the press</option>
                             </select>
                         </div>
+                    </div>
+                </details>
+
+                <details class="section">
+                    <summary>Cycle CSV files</summary>
+                    <div class="section-body">
+                        <label class="check" for="CSV_ENABLED">
+                            <input type="checkbox" id="CSV_ENABLED" name="CSV_ENABLED" checked>
+                            <span>Save every finished press cycle (OK and NG) to a CSV file</span>
+                        </label>
+                        <div class="field">
+                            <label for="CSV_MODE">New file</label>
+                            <select id="CSV_MODE" name="CSV_MODE">
+                                <option value="run">for every Start-Stop run</option>
+                                <option value="day">for every day</option>
+                            </select>
+                        </div>
+                        <div class="field">
+                            <label for="CSV_DAY_START">A new day starts at (computer time)</label>
+                            <input type="time" id="CSV_DAY_START" name="CSV_DAY_START" value="00:00" step="60">
+                            <p class="note">Only for "every day". 00:00 = calendar day. With 06:30, cycles from 06:30 until 06:29 the next morning go in one file, named after the day it started (for example cycles_day_2026-11-05_0630.csv).</p>
+                        </div>
+                        <div class="field">
+                            <label for="CSV_FOLDER">Folder (relative to config.json, or a full path)</label>
+                            <div class="scan-input-group">
+                                <input type="text" id="CSV_FOLDER" name="CSV_FOLDER" placeholder="exports">
+                                <button type="button" id="btn-browse-csv" class="btn btn-secondary btn-small" title="Choose a folder on this computer">Browse</button>
+                            </div>
+                            <div id="folder-browser" class="folder-browser hidden">
+                                <div class="fb-head">
+                                    <select id="fb-roots" class="hidden" aria-label="Drive"></select>
+                                    <button type="button" id="fb-up" class="btn btn-secondary btn-small">Up</button>
+                                    <button type="button" id="fb-new" class="btn btn-secondary btn-small">New folder</button>
+                                </div>
+                                <div id="fb-path" class="fb-path"></div>
+                                <div id="fb-list" class="fb-list"></div>
+                                <p id="fb-error" class="note fb-error"></p>
+                                <div class="fb-actions">
+                                    <button type="button" id="fb-select" class="btn btn-primary btn-small">Use this folder</button>
+                                    <button type="button" id="fb-cancel" class="btn btn-secondary btn-small">Cancel</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="field">
+                            <label for="CSV_END_LOAD_SETTING">End load setting (kg) in the cycle file</label>
+                            <input type="number" id="CSV_END_LOAD_SETTING" name="CSV_END_LOAD_SETTING" min="0" step="any" value="250">
+                        </div>
+                        <p class="note">One file (cycles_*.csv) with one row per finished cycle. Applies from the next Start. The file opens directly in Excel and is never deleted automatically.</p>
                     </div>
                 </details>
 

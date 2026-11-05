@@ -11,8 +11,12 @@ optional software"). The actual protocol used here comes from
 `891817107_COM_control.pdf` (a separate JP4 COM-communication manual) and
 has been verified live against a real JP4 press:
 
-- **Baud rate: 38400 bps** (not the documented 9600 default - this unit's
-  actual configured rate).
+- **Baud rate is set on the press, so it differs between units**: one unit
+  was found at 38400 bps, another at 9600 bps (the documented default). If a
+  press stays silent (`no_response`), scan the baud rates with the read-only
+  `N1` command before suspecting the cable; a wrong rate gives complete silence,
+  the same as a swapped TX/RX pair. Set the matching value in the panel's
+  serial settings.
 - Link settings: 8 data bits, no parity, 1 stop bit.
 - Frame format: `$` + 2-byte address + 1-byte command + 1-byte subcommand +
   data + 2-hex-char SUM checksum + CR. Checksum covers
@@ -34,6 +38,8 @@ has been verified live against a real JP4 press:
 |---|---|
 | `read_janome_jp4.py` | Core driver: builds/parses protocol frames, reads position/load telemetry, writes to a database on an interval. Also usable standalone via CLI (`--mock` for driver-free testing, `--once` for a single read). |
 | `local_store.py` | The local SQLite file with every run's readings and cycles (always written; see Database behaviour). |
+| `event_log.py` | The persistent event (error) log `logs/events.log`: one line per fail case and recovery (see Event log). |
+| `csv_export.py` | Writes the cycle CSV file, one file per run or per day (see Cycle CSV file). |
 | `database_handler.py` | SQLite/PostgreSQL/InfluxDB storage backend for the ingestion driver. |
 | `run_summary.py` | In-memory statistics and samples of the current/last run (Run summary card, CSV download). |
 | `app.py` | Flask-SocketIO web control panel (port 8085) - configure the serial port, start/stop real or mock ingestion, view live telemetry. |
@@ -133,6 +139,44 @@ Until that is done, use **Simulation** mode in the panel to exercise the rest of
 | 5 | InfluxDB fills up | InfluxDB deletes old data by itself according to the bucket's retention. Set `influx_retention_days` (Settings: "Keep data for") and the panel applies it to the bucket when ingestion starts (the token must be allowed to edit buckets; otherwise a warning is logged and it can be set in the InfluxDB UI). If InfluxDB rejects writes because its disk is full, the data waits in the edge spool like any other outage. |
 | 6 | Network down | Data is kept at the edge (memory, then the disk spool) and sent to InfluxDB when it is reachable again, oldest first, with the time it was read. Writes are idempotent in InfluxDB, so a batch sent twice does not create duplicates. |
 | 7 | Data for each stamping | One record per press stroke (`janome_jp4_telemetry_cycles` measurement or table): OK/NG, result code and text, program number, work time, preparation time, contact and end position/load, running OK/fault/lifetime counters, sensor fault location. |
+
+### Event log (the error log)
+
+Every case above leaves a clear line in **`logs/events.log`** (next to `config.json`; override with the
+environment variable `JANOME_EVENT_LOG`). It is also shown in the panel's **Event log** card
+(newest first, "Problems only" filter, Download button, `/api/events?limit=100&level=WARNING`) and in
+the normal Log. Unlike the pipeline log, which starts empty on every Start, this file is only ever
+appended to (rotated at 5 MB into `events.log.1` ...), so the history survives Stop/Start, a crash and a
+reboot. One line per event, one line per outage (not one per retry):
+
+```
+2026-11-05 11:20:46 | ERROR   | RS232_LOST        | RS-232 port COM7 is not available (adapter unplugged or port busy). Auto-reconnect: opening it again every 5 s. | port=COM7 reason=...
+2026-11-05 11:21:30 | INFO    | RS232_RECOVERED   | RS-232 port COM7 is back and the press answers; reading continues automatically (link was down 44 s). | port=COM7 down_for=44 s
+```
+
+| # | Event code (level) | When |
+|---|---|---|
+| 1 | `RS232_LOST` (ERROR), `RS232_RECOVERED` | USB/RS-232 adapter unplugged, port busy or missing; the port opens again by itself |
+| 1, 3 | `PRESS_NO_RESPONSE` (ERROR), `PRESS_RECOVERED` | Port is open but the press is silent: powered off, RS-232 cable pulled at the press, wrong baud rate. Recovery = press back on / cable back, with how long it was down |
+| 2 | `PRESS_NG` (WARNING) | A cycle finished NG: result code and text, program, end position and load, fault counter. Result codes 3229 / 3232 / 3233 are marked as "stopped before it finished (emergency stop / stop signal)" |
+| 4 | `SERVICE_START`, `UNCLEAN_SHUTDOWN` (WARNING when a run was active), `RUN_RESUMED`, `READER_START` | The panel came up. `UNCLEAN_SHUTDOWN` = the previous session was killed or lost power (with the time of its last sign of life); `RUN_RESUMED` = reading restarted by itself; `READER_START` says automatic or manual |
+| 4b | `READER_RESTARTED` (ERROR), `READER_ERROR` | The reader process died and the panel started it again (same run) |
+| 5 | `DB_FULL` (ERROR), `DB_REJECTED`, `DB_RETENTION` | InfluxDB out of space ("no space left", HTTP 507), a record refused, or the retention period applied/failed |
+| 6 | `DB_UNREACHABLE` (ERROR), `DB_RESTORED`, `DATA_DROPPED` | Network/database down (data kept at the edge) and synced again; `DATA_DROPPED` only if the edge buffer limit was hit |
+| 7 | `CYCLE_GAP` (WARNING), `CYCLE_COUNTER_RESET` | The press cycle counter jumped: cycles happened while nothing was reading (the counter of the last saved cycle is remembered across restarts), or it went backwards |
+| - | `RUN_START`, `RUN_STOP`, `READER_STOP` | Start/Stop by the operator, so a deliberate stop is never mistaken for a failure |
+
+### Start at boot and after a crash
+
+- Set **Start reading automatically** (Settings > Startup, `startup.auto_start_on_startup` in
+  `config.json`, mode `real`): whenever the panel starts, the reader starts too. Even without it, the panel
+  resumes by itself when a run was active at the time it went down.
+- `deploy/install_autostart.ps1` creates the Windows scheduled task `JanomeJP4Panel` that runs
+  `run_service.bat` and restarts it if it exits. `-Mode Logon` (no administrator needed) starts it when the
+  user logs in; the default `-Mode Startup` (Administrator PowerShell) starts it at boot, 30 s after
+  power-on, before anyone logs in. Remove it with `deploy/uninstall_autostart.ps1`.
+- A crash or hard kill of the panel or the reader was tried on a throwaway panel in simulation mode: the
+  reader came back by itself and the event log showed `UNCLEAN_SHUTDOWN`, `RUN_RESUMED`, `READER_RESTARTED`.
 
 Details worth knowing:
 
@@ -236,6 +280,75 @@ actual position, programmed position and load, plus a table of every reading.
   reading was taken; the panel uses it for the sample timestamps.
 - If the panel starts while a reader is already running, the summary begins at
   that moment.
+
+## Cycle CSV file (automatic)
+
+Every finished press cycle, OK and NG, is also appended as one row to a plain CSV file as it
+happens (`cycles_*.csv`). It is a small readable record that opens straight in Excel, next to the
+local SQLite file and the optional database. Each row is flushed and synced to disk before the next
+cycle is handled. This is the only CSV file the program writes.
+
+Settings (panel: **Cycle CSV files**, or `config.json`):
+
+```json
+"csv_export": { "enabled": true, "mode": "run", "folder": "exports",
+                "day_start": "00:00", "end_load_setting_kgf": 250 }
+```
+
+The **Folder** field has a **Browse...** button: it lists the folders of the computer running the
+panel. It starts at your **Home** folder (the Users folder of the signed-in user; if the field already
+holds a full path it starts there instead). The first entry of the drop-down is Home, followed by the
+drives, and there are sub-folders, Up and a "New folder" button. It fills in the full path you pick. Browsing is
+only allowed from the same computer (localhost); a panel opened from another PC must type the path.
+
+- `mode: "run"`: a new file for every Start-Stop run, `exports/cycles_run_2026-11-05_100635.csv`
+  (named after the run's start time). If the reader restarts by itself inside the same run, it
+  keeps appending to that file.
+- `mode: "day"`: one file per day (computer's local time), `exports/cycles_day_2026-11-05.csv`.
+  Several runs on the same day share the file, and a run that crosses the change of day continues in
+  the next day's file.
+- `day_start` (panel: **A new day starts at**, only used with `mode: "day"`, default `"00:00"`): the
+  time of day when the next file begins, for a shift that does not start at midnight. With
+  `"day_start": "07:00"` (7 am) every 07:00 is the start of a new day: the cycles from 07:00 until
+  06:59 the next morning go in one file, named after the day it started and with the start time:
+  `exports/cycles_day_2026-11-05_0700.csv` (a 02:00 cycle on 6 Nov is still in the 5 Nov file). `00:00` keeps the plain calendar-day name. An invalid value
+  logs a `[CSV]` warning and uses 00:00. Changing it mid-day starts a differently named file instead
+  of mixing the two.
+- `folder` is relative to `config.json` unless it is a full path. Files are never deleted
+  automatically.
+- The settings are read when a run starts, so a change applies from the next Start.
+
+Columns, in this order:
+
+| # | Column | Where it comes from |
+|---|---|---|
+| 1 | `pressing_speed_mm_s` | the program's pressing speed setting (read with S2) |
+| 2 | `return_speed_mm_s` | the program's return speed setting (S2) |
+| 3 | `start_position_mm` | the program's start position setting (S2) |
+| 4 | `stroke_mm` | calculated: end position setting - start position |
+| 5 | `end_position_mm` | actual end position of the cycle |
+| 6 | `end_load_kgf` | actual end load in kg: `end_load_n / 9.80665` (the press screen shows kg) |
+| 7 | `end_load_setting_kgf` | setting `end_load_setting_kgf` (default 250). The press does not keep this target in stop-position mode, so it is configured here |
+| 8 | `end_load_diff_kgf` | actual end load difference: `end_load_kgf - end_load_setting_kgf` (negative = below the setting) |
+| 9-10 | `prep_time_s`, `work_time_s` | preparation time and work time of the cycle (Quality Data frame) |
+| 11-13 | `time_local`, `time_utc`, `run_id` | when the cycle was received, and the run |
+| 14-17 | `program_number`, `ok` (1/0), `result_code`, `result_text` | which program and the result |
+| 18-19 | `end_position_set_mm`, `end_load_n` | the end position setting (S2) and the end load in N |
+| 20-21 | `contact_position_mm`, `contact_load_n` | where the ram touched the part |
+| 22-24 | `ok_total`, `fault_total`, `lifetime_total` | the press counters |
+| 25-27 | `sensor_fault_section`, `sensor_fault_number`, `backlog` (1/0) | sensor fault and whether the cycle was queued in the press |
+
+Values that would only repeat an earlier column are not written again (for example the program's
+start position appears once). The program settings are read once per program and refreshed every 5
+minutes, so a burst of cycles does not slow the link. A value that cannot be worked out (the press
+did not answer S2) is left empty, and a press that ignores S2 only logs a
+`[CSV] Extra read failed` warning; the readings and the link are not affected. S2 is read-only and
+cannot move the press. Which S2 item is the return speed (2030) was inferred from one press and is
+worth checking against the press screen. If a file of the same name already exists with other columns
+(an older version), the new rows go to a numbered file (`..._2.csv`) and the old one is untouched.
+
+A folder that cannot be written (or an unknown mode) only logs a `[CSV]` warning; collection, the
+local file and the database carry on.
 
 ## Environment variables
 

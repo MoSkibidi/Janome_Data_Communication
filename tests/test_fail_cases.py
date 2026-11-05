@@ -33,11 +33,11 @@ def frame(body):
     return b"$" + body.encode() + f"{sum(body.encode()) & 0xFF:02X}".encode() + b"\r"
 
 
-def v1_data(result_code=0, ok_total=10, fault_total=1, end_pos=87.1575, end_load=677.8):
-    """88 hex characters in the Quality Data (V1) layout."""
+def v1_data(result_code=0, ok_total=10, fault_total=1, end_pos=87.1575, end_load=677.8, tail=""):
+    """88 hex characters in the Quality Data (V1) layout, plus an optional sensor data tail."""
     return (f"{1:04X}{ok_total:08X}{fault_total:08X}{ok_total + fault_total:08X}{result_code:04X}{0:04X}{0:04X}"
             f"{28098:08X}{1310:08X}{int(86.162 * 10000):08X}{int(417.1 * 10):08X}"
-            f"{int(end_pos * 10000):08X}{int(end_load * 10):08X}")
+            f"{int(end_pos * 10000):08X}{int(end_load * 10):08X}{tail}")
 
 
 class World:
@@ -48,6 +48,7 @@ class World:
         self.powered = True
         self.q1 = False
         self.q1_count = 0
+        self.extras = True  # answers K0 (I/O), S2 (settings) and B0 (system info); False = the press ignores them
         self.rx = bytearray()
         self.opens = 0
         self.lock = threading.Lock()
@@ -111,6 +112,15 @@ class FakeSerial:
                 w.q1 = sub == "1"
                 w.q1_count += 1 if w.q1 else 0
                 w.rx.extend(frame(f"01q{sub}"))
+            elif w.extras and cmd == "K":
+                io_type = int(data[5:9], 16)
+                w.rx.extend(frame(f"01k0{io_type:04X}{0x10 + io_type:02X}0000"))
+            elif w.extras and cmd == "S":
+                item = int(data[17:21], 16)
+                value = {2006: 100000, 2030: 80000, 2005: 290000, 2017: 378140}[item]
+                w.rx.extend(frame(f"01s2{0:04X}{value:08X}"))
+            elif w.extras and cmd == "B":
+                w.rx.extend(frame("01b0" + "01" + "00" + "0A" + "00" + "02" + "01" + "0000" + "00C8" + "0000" + "0000" + "03"))
 
     def close(self):
         self.is_open = False
@@ -132,6 +142,7 @@ class FastTime:
 class FakeInflux:
     def __init__(self):
         self.down = False
+        self.full = False         # while down: answer like a server whose disk is full instead of "unavailable"
         self.writes = []          # raw request bodies that were accepted
         self.write_headers = []
         self.retention_patches = []
@@ -169,6 +180,8 @@ class FakeInflux:
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length)
                 if outer.down:
+                    if outer.full:
+                        return self._send(500, b'{"message":"write failed: no space left on device"}')
                     return self._send(503, b'{"message":"unavailable"}')
                 if self.headers.get("Authorization") != "Token secret":
                     return self._send(401, b'{"message":"unauthorized"}')
@@ -506,6 +519,512 @@ class LocalFileCases(unittest.TestCase):
         self.assertEqual(store.count_samples(), 1000)
         first = next(store.run_samples(run_id))
         self.assertEqual(first[1], 300.0)
+
+
+class CsvFileCases(unittest.TestCase):
+    """Every finished cycle is also appended to a CSV file: one file per run, or one per day."""
+
+    CYCLE = {"program_number": 5, "ok": True, "result_code": 0, "result_text": "Normal", "prep_time_s": 1.5,
+             "work_time_s": 0.3, "contact_position_mm": 29.0, "contact_load_n": 0.0, "end_position_mm": 37.8,
+             "end_load_n": 2500.0, "ok_total": 10, "fault_total": 2, "lifetime_total": 12,
+             "sensor_fault_section": 0, "sensor_fault_number": 0, "backlog": False}
+
+    def rows(self, path):
+        import csv
+        with open(path, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    def test_run_mode_one_file_header_once_and_restart_appends_to_the_same_file(self):
+        import csv_export
+        folder = os.path.join(tempfile.mkdtemp(), "exports")
+        started = datetime(2026, 11, 5, 3, 6, 35, tzinfo=timezone.utc)
+        when = datetime(2026, 11, 5, 3, 9, 33, tzinfo=timezone.utc)
+        first = csv_export.CsvExporter(folder, "run", run_started=started, run_id=7)
+        path = first.add_cycle(when, self.CYCLE)
+        # the reader was restarted inside the same run: a new exporter, same run start
+        second = csv_export.CsvExporter(folder, "run", run_started=started, run_id=7)
+        ng = dict(self.CYCLE, ok=False, result_code=3232, result_text="External signal stopped", backlog=True)
+        self.assertEqual(second.add_cycle(when.replace(minute=10), ng), path)
+        rows = self.rows(path)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r["ok"] for r in rows], ["1", "0"])
+        self.assertEqual(rows[1]["result_code"], "3232")
+        self.assertEqual(rows[1]["backlog"], "1")
+        self.assertEqual(rows[0]["run_id"], "7")
+        self.assertTrue(rows[0]["time_utc"].startswith("2026-11-05T03:09:33"))
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read().count("time_local"), 1, "the header is written once")
+        self.assertEqual(os.listdir(folder), [os.path.basename(path)])
+        self.assertTrue(os.path.basename(path).startswith("cycles_run_"))
+
+    def test_a_new_run_gets_its_own_file(self):
+        import csv_export
+        folder = tempfile.mkdtemp()
+        when = datetime(2026, 11, 5, 3, 9, 33, tzinfo=timezone.utc)
+        a = csv_export.CsvExporter(folder, "run", run_started=when, run_id=1).add_cycle(when, self.CYCLE)
+        b = csv_export.CsvExporter(folder, "run", run_started=when.replace(minute=30), run_id=2).add_cycle(when, self.CYCLE)
+        self.assertNotEqual(a, b)
+
+    def test_day_mode_starts_a_new_file_at_midnight_and_ignores_the_run(self):
+        import csv_export
+        folder = tempfile.mkdtemp()
+        exporter = csv_export.CsvExporter(folder, "day", run_id=1)
+        day1 = datetime(2026, 11, 5, 12, 0, 0).astimezone()
+        day2 = datetime(2026, 11, 6, 0, 0, 1).astimezone()
+        p1 = exporter.add_cycle(day1, self.CYCLE)
+        p2 = exporter.add_cycle(day2, self.CYCLE)
+        again = csv_export.CsvExporter(folder, "day", run_id=2).add_cycle(day1.replace(hour=13), self.CYCLE)
+        self.assertNotEqual(p1, p2)
+        self.assertEqual(p1, again, "another run on the same day appends to that day's file")
+        self.assertEqual(len(self.rows(p1)), 2)
+        self.assertIn("2026-11-05", p1)
+        self.assertIn("2026-11-06", p2)
+
+    def test_day_start_moves_the_change_of_day_and_shows_in_the_file_name(self):
+        import csv_export
+        folder = tempfile.mkdtemp()
+        exporter = csv_export.CsvExporter(folder, "day", run_id=1, day_start="06:30")
+        local = lambda d, h, m: datetime(2026, 11, d, h, m, 0).astimezone()
+        evening = exporter.path_for(local(5, 23, 0))
+        after_midnight = exporter.path_for(local(6, 2, 0))
+        just_before = exporter.path_for(local(6, 6, 29))
+        at_start = exporter.path_for(local(6, 6, 30))
+        self.assertTrue(evening.endswith("cycles_day_2026-11-05_0630.csv"), evening)
+        self.assertEqual(evening, after_midnight, "02:00 still belongs to the day that started at 06:30 yesterday")
+        self.assertEqual(evening, just_before)
+        self.assertTrue(at_start.endswith("cycles_day_2026-11-06_0630.csv"), at_start)
+        self.assertEqual(len(self.rows(exporter.add_cycle(local(6, 2, 0), self.CYCLE))), 1)
+
+    def test_seven_am_starts_a_new_day(self):
+        import csv_export
+        exporter = csv_export.CsvExporter(tempfile.mkdtemp(), "day", day_start="07:00")
+        at = lambda d, h, m: exporter.path_for(datetime(2026, 11, d, h, m, 0).astimezone())
+        self.assertTrue(at(5, 7, 0).endswith("cycles_day_2026-11-05_0700.csv"))
+        self.assertEqual(at(5, 7, 0), at(6, 6, 59), "06:59 next morning is still the day that began at 07:00")
+        self.assertTrue(at(6, 7, 0).endswith("cycles_day_2026-11-06_0700.csv"))
+        self.assertEqual(at(6, 0, 0), at(5, 23, 59), "midnight does not start a new day")
+
+    def test_midnight_day_start_keeps_the_plain_calendar_name(self):
+        import csv_export
+        folder = tempfile.mkdtemp()
+        for kwargs in ({}, {"day_start": "00:00"}, {"day_start": "0:00"}):
+            path = csv_export.CsvExporter(folder, "day", **kwargs).path_for(datetime(2026, 11, 5, 12, 0).astimezone())
+            self.assertTrue(path.endswith("cycles_day_2026-11-05.csv"), path)
+
+    def test_day_start_is_checked(self):
+        import csv_export
+        self.assertEqual(csv_export.parse_day_start("06:30"), (6, 30))
+        self.assertEqual(csv_export.parse_day_start("6:05:59"), (6, 5))
+        self.assertEqual(csv_export.parse_day_start(None), (0, 0))
+        for bad in ("24:00", "12:60", "noon", "6", "-1:00", ""):
+            with self.assertRaises(ValueError, msg=bad):
+                csv_export.parse_day_start(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                csv_export.CsvExporter(tempfile.mkdtemp(), "day", day_start=bad)
+
+    def test_the_reader_uses_day_start_and_falls_back_on_a_bad_value(self):
+        for value in ("06:30", "nonsense"):
+            run = LoopRunner(self, {"database": {"db_type": "none"}, "csv_export": {"mode": "day", "day_start": value}}).start()
+            wait_for(lambda: "[LINK] state=up" in run.text())
+            time.sleep(0.2)
+            run.world.push_cycle(result_code=0)
+            wait_for(lambda: run.count("[CYCLE]") >= 1)
+            run.finish()
+            (name,) = os.listdir(os.path.join(run.tmp, "exports"))
+            if value == "nonsense":
+                self.assertIn("Bad csv_export day_start", run.text())
+                self.assertRegex(name, r"^cycles_day_\d{4}-\d\d-\d\d\.csv$")
+            else:
+                self.assertRegex(name, r"^cycles_day_\d{4}-\d\d-\d\d_0630\.csv$")
+
+    def test_unknown_mode_is_rejected(self):
+        import csv_export
+        with self.assertRaises(ValueError):
+            csv_export.CsvExporter(tempfile.mkdtemp(), "week")
+
+    def test_the_reader_writes_ok_and_ng_cycles_to_exports(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}}).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(result_code=3232)
+        wait_for(lambda: run.count("[CYCLE]") >= 1)
+        run.world.push_cycle(result_code=0)
+        wait_for(lambda: run.count("[CYCLE]") >= 2)
+        run.finish()
+        folder = os.path.join(run.tmp, "exports")
+        files = [n for n in os.listdir(folder) if n.startswith("cycles_")]
+        self.assertEqual(len(files), 1)
+        self.assertEqual(len(os.listdir(folder)), 1, "only the cycle file is written")
+        rows = self.rows(os.path.join(folder, files[0]))
+        self.assertEqual([r["result_code"] for r in rows], ["3232", "0"])
+        self.assertEqual([r["ok"] for r in rows], ["0", "1"])
+
+    def test_csv_can_be_switched_off(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}, "csv_export": {"enabled": False}}).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(result_code=0)
+        wait_for(lambda: run.count("[CYCLE]") >= 1)
+        run.finish()
+        self.assertFalse(os.path.exists(os.path.join(run.tmp, "exports")))
+
+    def test_unusable_folder_never_stops_the_collection(self):
+        blocker = os.path.join(tempfile.mkdtemp(), "not_a_folder")
+        with open(blocker, "w") as f:
+            f.write("x")
+        run = LoopRunner(self, {"database": {"db_type": "none"}, "csv_export": {"folder": blocker}}).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(result_code=0)
+        wait_for(lambda: run.count("[CYCLE]") >= 1)
+        wait_for(lambda: run.count("[STATS]") >= 4)
+        run.finish()
+        self.assertIn("[CSV] Cannot use the folder", run.text())
+        conn = sqlite3.connect(os.path.join(run.tmp, "janome_jp4_local.db"))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM cycles").fetchone()[0], 1, "the local file still got the cycle")
+
+
+class CycleReportCases(unittest.TestCase):
+    """The Basic file follows the cycle report: speeds, positions, stroke, end load in kg and its difference to the setting."""
+
+    CYCLE = CsvFileCases.CYCLE
+    SETTINGS = {"set_pressing_speed_mm_s": 100.0, "set_return_speed_mm_s": 80.0,
+                "set_start_position_mm": 29.0, "set_end_position_mm": 37.814}
+    TARGETS = {"end_load_setting_kgf": 250}
+
+    def row(self, cycle, settings, targets):
+        import csv
+        import csv_export
+        folder = tempfile.mkdtemp()
+        when = datetime(2026, 11, 5, 3, 9, 33, tzinfo=timezone.utc)
+        path = csv_export.CsvExporter(folder, "run", run_started=when).add_cycle(when, cycle, settings, targets)
+        with open(path, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))[0]
+
+    def test_report_values_from_settings_and_the_cycle(self):
+        cycle = dict(self.CYCLE, prep_time_s=0.24, work_time_s=0.318, end_position_mm=37.812, end_load_n=2531.6)
+        row = self.row(cycle, self.SETTINGS, self.TARGETS)
+        self.assertEqual((row["pressing_speed_mm_s"], row["return_speed_mm_s"]), ("100.0", "80.0"))
+        self.assertEqual((row["start_position_mm"], row["end_position_set_mm"], row["stroke_mm"]), ("29.0", "37.814", "8.814"))
+        self.assertEqual((row["end_position_mm"], row["end_load_n"], row["end_load_kgf"]), ("37.812", "2531.6", "258.2"))
+        self.assertEqual((row["end_load_setting_kgf"], row["end_load_diff_kgf"]), ("250", "8.2"))
+        self.assertEqual((row["prep_time_s"], row["work_time_s"]), ("0.24", "0.318"))
+        self.assertNotIn("cycle_time_s", row)
+        self.assertNotIn("uph", row)
+        self.assertNotIn("uph_ok", row)
+
+    def test_end_load_below_the_setting_gives_a_negative_difference(self):
+        row = self.row(dict(self.CYCLE, end_load_n=2354.0), self.SETTINGS, self.TARGETS)  # 240.0 kg
+        self.assertEqual((row["end_load_kgf"], row["end_load_diff_kgf"]), ("240.0", "-10.0"))
+
+    def test_values_that_cannot_be_worked_out_stay_empty(self):
+        row = self.row(self.CYCLE, None, {})
+        self.assertEqual([row[c] for c in ("pressing_speed_mm_s", "return_speed_mm_s", "stroke_mm",
+                                           "end_load_setting_kgf", "end_load_diff_kgf")], [""] * 5)
+        self.assertEqual(row["result_code"], "0")
+
+    def test_file_with_other_columns_is_left_alone_and_a_numbered_file_is_used(self):
+        import csv_export
+        folder = tempfile.mkdtemp()
+        when = datetime(2026, 11, 5, 3, 9, 33, tzinfo=timezone.utc)
+        exporter = csv_export.CsvExporter(folder, "day")
+        old = exporter.path_for(when)
+        with open(old, "w", newline="", encoding="utf-8") as f:
+            f.write("time_local,time_utc,run_id,program_number\r\nx,y,1,5\r\n")
+        used = csv_export.CsvExporter(folder, "day").add_cycle(when, self.CYCLE, self.SETTINGS, self.TARGETS)
+        self.assertEqual(used, old.replace(".csv", "_2.csv"))
+        with open(old, encoding="utf-8") as f:
+            self.assertEqual(len(f.readlines()), 2, "the older file is untouched")
+
+    def test_the_reader_fills_the_report_from_the_press_settings(self):
+        cfg = {"database": {"db_type": "none"}, "csv_export": {}}
+        run = LoopRunner(self, cfg).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(result_code=0, end_pos=37.812, end_load=2531.6)
+        wait_for(lambda: run.count("[CYCLE]") >= 1)
+        run.finish()
+        import csv
+        folder = os.path.join(run.tmp, "exports")
+        (name,) = os.listdir(folder)
+        with open(os.path.join(folder, name), newline="", encoding="utf-8") as f:
+            (row,) = list(csv.DictReader(f))
+        self.assertEqual((row["pressing_speed_mm_s"], row["return_speed_mm_s"], row["stroke_mm"]), ("100.0", "80.0", "8.814"))
+        self.assertEqual((row["end_load_kgf"], row["end_load_setting_kgf"]), ("258.2", "250"))
+        self.assertEqual((row["prep_time_s"], row["work_time_s"]), ("28.098", "1.31"))
+        self.assertEqual(row["end_load_diff_kgf"], "8.2")
+
+
+class FolderBrowserCases(unittest.TestCase):
+    """The folder list behind the Browse button of the CSV folder setting."""
+
+    def test_lists_sub_folders_sorted_without_files_or_hidden_ones(self):
+        import folder_browser
+        base = tempfile.mkdtemp()
+        for name in ("beta", "Alpha", ".hidden", "$Recycle.Bin"):
+            os.mkdir(os.path.join(base, name))
+        with open(os.path.join(base, "file.txt"), "w") as f:
+            f.write("x")
+        result = folder_browser.browse(base, base)
+        self.assertEqual([f["name"] for f in result["folders"]], ["Alpha", "beta"])
+        self.assertEqual(result["path"], os.path.normpath(base))
+        self.assertEqual(result["parent"], os.path.dirname(os.path.normpath(base)))
+        self.assertTrue(result["roots"])
+
+    def test_relative_path_is_taken_from_the_base_and_a_missing_folder_shows_the_nearest_one(self):
+        import folder_browser
+        base = tempfile.mkdtemp()
+        os.mkdir(os.path.join(base, "exports"))
+        self.assertEqual(folder_browser.browse("exports", base)["path"], os.path.join(base, "exports"))
+        self.assertEqual(folder_browser.browse("exports/not_yet/deeper", base)["path"], os.path.join(base, "exports"))
+        result = folder_browser.browse("", base)  # nothing chosen yet: browsing starts at the home folder
+        self.assertEqual(result["path"], folder_browser.home())
+        self.assertEqual(result["home"], folder_browser.home())
+        self.assertTrue(os.path.isdir(result["path"]))
+
+    def test_new_folder_is_created_and_bad_names_are_refused(self):
+        import folder_browser
+        base = tempfile.mkdtemp()
+        path = folder_browser.make_folder(base, "Janome data", base)
+        self.assertTrue(os.path.isdir(path))
+        for bad in ("", "  ", "..", "a/b", "a\\b", "a:b", "what?", "dot."):
+            with self.assertRaises(folder_browser.BrowseError, msg=bad):
+                folder_browser.make_folder(base, bad, base)
+        with self.assertRaises(folder_browser.BrowseError):
+            folder_browser.make_folder(base, "Janome data", base)  # already there
+        with self.assertRaises(folder_browser.BrowseError):
+            folder_browser.make_folder(os.path.join(base, "missing"), "x", base)
+
+
+class EventLogCases(unittest.TestCase):
+    """Every fail case leaves a clear line in logs/events.log (the error log), with a recovery line when it ends."""
+
+    def events(self, run, level=None):
+        import event_log
+        return event_log.read_recent(os.path.join(run.tmp, "logs", "events.log"), 1000, level)
+
+    def codes(self, run):
+        return [e["code"] for e in self.events(run)]
+
+    def test_1_cable_pulled_is_logged_as_lost_then_recovered(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}}).start()
+        wait_for(lambda: run.count("[STATS]") >= 2)
+        run.world.plugged = False
+        wait_for(lambda: "RS232_LOST" in self.codes(run), what="RS232_LOST event")
+        run.world.plugged = True
+        wait_for(lambda: "RS232_RECOVERED" in self.codes(run), what="RS232_RECOVERED event")
+        events = {e["code"]: e for e in self.events(run)}
+        self.assertEqual(events["RS232_LOST"]["level"], "ERROR")
+        self.assertIn("COM9", events["RS232_LOST"]["message"])
+        self.assertIn("Auto-reconnect", events["RS232_LOST"]["message"])
+        self.assertIn("reading continues automatically", events["RS232_RECOVERED"]["message"])
+        self.assertIn("down_for=", events["RS232_RECOVERED"]["details"])
+        self.assertEqual(self.codes(run).count("RS232_LOST"), 1, "one line per outage, not one per retry")
+
+    def test_3_press_off_and_on_is_logged_as_no_response_then_recovered(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}}).start()
+        wait_for(lambda: run.count("[STATS]") >= 2)
+        run.world.powered = False
+        run.world.q1 = False
+        wait_for(lambda: "PRESS_NO_RESPONSE" in self.codes(run), what="PRESS_NO_RESPONSE event")
+        run.world.powered = True
+        wait_for(lambda: "PRESS_RECOVERED" in self.codes(run), what="PRESS_RECOVERED event")
+        codes = self.codes(run)
+        self.assertLess(codes.index("PRESS_NO_RESPONSE"), codes.index("PRESS_RECOVERED"))
+        self.assertEqual(codes.count("PRESS_NO_RESPONSE"), 1)
+
+    def test_2_ng_and_emergency_stop_are_logged_with_their_data(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}}).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(result_code=0)
+        run.world.push_cycle(result_code=3232, fault_total=2, ok_total=10)
+        run.world.push_cycle(result_code=3225, fault_total=3, ok_total=10)
+        wait_for(lambda: run.count("[CYCLE]") >= 3)
+        run.finish()
+        ng = [e for e in self.events(run) if e["code"] == "PRESS_NG"]
+        self.assertEqual(len(ng), 2, "the OK cycle is not an event")
+        self.assertEqual(ng[0]["level"], "WARNING")
+        self.assertIn("3232", ng[0]["message"])
+        self.assertIn("emergency stop", ng[0]["message"])
+        self.assertIn("result_code=3232", ng[0]["details"])
+        self.assertNotIn("emergency stop", ng[1]["message"], "a time-exceeded NG is not a stop")
+
+    def test_7_missing_cycles_are_reported_as_a_gap(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}}).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(ok_total=10, fault_total=1)   # counter 11
+        run.world.push_cycle(ok_total=11, fault_total=1)   # counter 12: continuous
+        run.world.push_cycle(ok_total=15, fault_total=1)   # counter 16: 3 cycles missing
+        run.world.push_cycle(ok_total=2, fault_total=0)    # counter 2: went backwards
+        wait_for(lambda: run.count("[CYCLE]") >= 4)
+        run.finish()
+        events = self.events(run)
+        (gap,) = [e for e in events if e["code"] == "CYCLE_GAP"]
+        self.assertIn("3 stamping cycle(s) are missing", gap["message"])
+        self.assertIn("counter_from=12 counter_to=16", gap["details"])
+        (reset,) = [e for e in events if e["code"] == "CYCLE_COUNTER_RESET"]
+        self.assertIn("from 16 to 2", reset["message"])
+
+    def test_7b_the_counter_is_remembered_across_a_restart(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}}).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(ok_total=10, fault_total=1)
+        wait_for(lambda: run.count("[CYCLE]") >= 1)
+        run.finish()
+        # the PC was off for a while and the press made 4 strokes meanwhile
+        run2 = LoopRunner(self, {"database": {"db_type": "none"}})
+        run2.config_path = run.config_path
+        run2.start()
+        wait_for(lambda: "[LINK] state=up" in run2.text())
+        time.sleep(0.2)
+        run2.world.push_cycle(ok_total=14, fault_total=1)
+        wait_for(lambda: run2.count("[CYCLE]") >= 1)
+        run2.finish()
+        gaps = [e for e in self.events(run) if e["code"] == "CYCLE_GAP"]
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("counter_from=11 counter_to=15", gaps[0]["details"])
+        self.assertEqual(self.codes(run).count("READER_START"), 2, "each start of the reader is on record")
+
+    def test_5_6_database_down_and_back_are_logged(self):
+        influx = FakeInflux()
+        self.addCleanup(influx.stop)
+        cfg = {"db_type": "influxdb", "influx_url": influx.url, "influx_token": "secret", "influx_org": "org",
+               "influx_bucket": "jp4", "retry_interval": 0.2}
+        run = LoopRunner(self, {"database": cfg}).start()
+        wait_for(lambda: len(influx.lines()) >= 2)
+        influx.down = True
+        wait_for(lambda: "DB_UNREACHABLE" in self.codes(run), what="DB_UNREACHABLE event")
+        influx.down = False
+        wait_for(lambda: "DB_RESTORED" in self.codes(run), what="DB_RESTORED event")
+        events = {e["code"]: e for e in self.events(run)}
+        self.assertEqual(events["DB_UNREACHABLE"]["level"], "ERROR")
+        self.assertIn("stored at the edge", events["DB_UNREACHABLE"]["message"])
+        self.assertIn("syncing", events["DB_RESTORED"]["message"])
+        self.assertEqual(self.codes(run).count("DB_UNREACHABLE"), 1, "one line per outage, not one per retry")
+
+    def test_5_full_database_is_reported_as_full_not_as_network(self):
+        influx = FakeInflux()
+        self.addCleanup(influx.stop)
+        influx.full = True
+        cfg = {"db_type": "influxdb", "influx_url": influx.url, "influx_token": "secret", "influx_org": "org",
+               "influx_bucket": "jp4", "retry_interval": 0.2}
+        run = LoopRunner(self, {"database": cfg}).start()
+        wait_for(lambda: len(influx.lines()) >= 2)
+        influx.down = True
+        wait_for(lambda: "DB_FULL" in self.codes(run), what="DB_FULL event")
+        full = [e for e in self.events(run) if e["code"] == "DB_FULL"][0]
+        self.assertIn("no space left", full["message"])
+        self.assertNotIn("DB_UNREACHABLE", self.codes(run))
+
+    def test_classify_db_error(self):
+        from database_handler import classify_db_error
+        self.assertEqual(classify_db_error(Exception("InfluxDB HTTP 507: Insufficient Storage")), "DB_FULL")
+        self.assertEqual(classify_db_error(Exception("write failed: No space left on device")), "DB_FULL")
+        self.assertEqual(classify_db_error(Exception("cannot reach InfluxDB at http://x: timed out")), "DB_UNREACHABLE")
+
+    def test_manual_start_with_database_unreachable_is_logged_before_exiting(self):
+        influx = FakeInflux()
+        self.addCleanup(influx.stop)
+        influx.down = True
+        cfg = {"db_type": "influxdb", "influx_url": influx.url, "influx_token": "secret", "influx_org": "org", "influx_bucket": "jp4"}
+        run = LoopRunner(self, {"database": cfg}).start()
+        run.thread.join(10)
+        self.assertEqual(run.result, 2)
+        (event,) = [e for e in self.events(run) if e["code"] == "DB_UNREACHABLE"]
+        self.assertIn("Reading was not started", event["message"])
+
+    def test_event_file_format_filter_and_rotation(self):
+        import event_log
+        path = os.path.join(tempfile.mkdtemp(), "logs", "events.log")
+        line = event_log.emit("RS232_LOST", "port gone | really\nnow", level="ERROR", path=path, port="COM7", empty=None)
+        event_log.emit("SERVICE_START", "panel up", path=path)
+        self.assertRegex(line, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \| ERROR   \| RS232_LOST\s+\| port gone / really now \| port=COM7$")
+        events = event_log.read_recent(path, 10)
+        self.assertEqual([e["code"] for e in events], ["RS232_LOST", "SERVICE_START"])
+        self.assertEqual(events[0]["details"], "port=COM7")
+        self.assertEqual([e["code"] for e in event_log.read_recent(path, 10, "WARNING")], ["RS232_LOST"])
+        self.assertEqual(len(event_log.read_recent(path, 1)), 1)
+        saved = event_log.MAX_BYTES
+        try:
+            event_log.MAX_BYTES = 10
+            event_log.emit("SERVICE_START", "again", path=path)
+        finally:
+            event_log.MAX_BYTES = saved
+        self.assertTrue(os.path.exists(path + ".1"), "a full file is rotated, never truncated")
+        self.assertEqual([e["code"] for e in event_log.read_recent(path, 10)], ["SERVICE_START"])
+        self.assertEqual(event_log.read_recent(os.path.join(tempfile.mkdtemp(), "none.log")), [])
+
+    def test_a_log_file_that_cannot_be_written_never_stops_the_collection(self):
+        import event_log
+        blocker = os.path.join(tempfile.mkdtemp(), "file")
+        with open(blocker, "w") as f:
+            f.write("x")
+        event_log.emit("SERVICE_START", "still fine", path=os.path.join(blocker, "sub", "events.log"))  # must not raise
+
+
+class SingleCsvCases(unittest.TestCase):
+    """Only one CSV file is written: the cycle file, with the report columns first."""
+
+    FIRST = ["pressing_speed_mm_s", "return_speed_mm_s", "start_position_mm", "stroke_mm",
+             "end_position_mm", "end_load_kgf", "end_load_setting_kgf", "end_load_diff_kgf",
+             "prep_time_s", "work_time_s"]
+
+    def run_with_cycle(self, extras=True):
+        run = LoopRunner(self, {"database": {"db_type": "none"}})
+        run.world.extras = extras
+        run.start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(result_code=3232, tail="ABCD")
+        wait_for(lambda: run.count("[CYCLE]") >= 1)
+        wait_for(lambda: run.count("[STATS]") >= 6)
+        run.finish()
+        return run
+
+    def read(self, run):
+        import csv
+        folder = os.path.join(run.tmp, "exports")
+        (name,) = os.listdir(folder)
+        self.assertTrue(name.startswith("cycles_run_"), "no other CSV file is written")
+        with open(os.path.join(folder, name), newline="", encoding="utf-8") as f:
+            return list(csv.reader(f))
+
+    def test_columns_start_with_the_report_and_none_is_repeated(self):
+        import csv_export
+        self.assertEqual(csv_export.COLUMNS[:len(self.FIRST)], self.FIRST)
+        self.assertEqual(len(csv_export.COLUMNS), len(set(csv_export.COLUMNS)), "no column twice")
+        for name in ("time_local", "time_utc", "run_id", "program_number", "ok", "result_code", "result_text",
+                     "end_position_set_mm", "end_load_n",
+                     "contact_position_mm", "contact_load_n", "ok_total", "fault_total", "lifetime_total",
+                     "sensor_fault_section", "sensor_fault_number", "backlog"):
+            self.assertIn(name, csv_export.COLUMNS)
+        self.assertFalse([c for c in csv_export.COLUMNS if c.startswith(("set_", "v1_", "io_", "full"))])
+        self.assertNotIn("cycle_time_s", csv_export.COLUMNS)
+        self.assertFalse([c for c in csv_export.COLUMNS if c.startswith("uph")], "UPH is not in the file")
+
+    def test_the_reader_writes_one_file_with_the_report_first(self):
+        run = self.run_with_cycle()
+        header, row = self.read(run)
+        self.assertEqual(header[:len(self.FIRST)], self.FIRST)
+        values = dict(zip(header, row))
+        self.assertEqual([values[c] for c in self.FIRST[:4]], ["100.0", "80.0", "29.0", "8.814"])
+        self.assertEqual(values["result_code"], "3232")
+        cycle_lines = [ln for ln in run.text().splitlines() if ln.startswith("[CYCLE]")]
+        self.assertNotIn("v1_raw", cycle_lines[0])
+        conn = sqlite3.connect(os.path.join(run.tmp, "janome_jp4_local.db"))
+        self.assertNotIn("v1_raw", json.loads(conn.execute("SELECT payload FROM cycles").fetchone()[0]))
+
+    def test_press_that_ignores_the_settings_read_never_stops_the_collection(self):
+        run = self.run_with_cycle(extras=False)
+        self.assertNotIn("[LINK] state=no_response", run.text())
+        header, row = self.read(run)
+        values = dict(zip(header, row))
+        self.assertEqual([values[c] for c in ("pressing_speed_mm_s", "return_speed_mm_s", "start_position_mm", "stroke_mm")], [""] * 4)
+        self.assertEqual(values["result_code"], "3232")
+        self.assertIn("[CSV] Extra read failed", run.text())
 
 
 if __name__ == "__main__":

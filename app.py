@@ -20,7 +20,10 @@ import time
 from datetime import datetime, timezone
 from flask import Flask, render_template, jsonify, request, Response
 from flask_socketio import SocketIO, emit
+import atexit
 import local_store
+import folder_browser
+import event_log
 from run_summary import RunSummary, restore_from_store
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
@@ -34,10 +37,13 @@ DATA_DIR = os.path.abspath(os.environ.get('JANOME_DATA_DIR', BASE_DIR))
 os.makedirs(DATA_DIR, exist_ok=True)
 
 CONFIG_PATH = os.path.join(DATA_DIR, 'config.json')
+EVENTS_PATH = event_log.default_path(CONFIG_PATH)  # the persistent error/event log
+event_log.configure(EVENTS_PATH)
 PID_PATH = os.path.join(DATA_DIR, '.janome_jp4_process.pid')
 MODE_PATH = os.path.join(DATA_DIR, '.janome_jp4_process.mode')
 DESIRED_STATE_PATH = os.path.join(DATA_DIR, '.janome_jp4_desired_state.json')
 LOG_PATH = os.path.join(DATA_DIR, 'janome_jp4_pipeline.log')
+HEARTBEAT_PATH = os.path.join(DATA_DIR, '.janome_jp4_heartbeat.json')
 
 # Seed an empty data dir with the bundled config (its serial settings differ from the built-in defaults).
 _SEED_CONFIG = os.path.join(BASE_DIR, 'config.json')
@@ -443,6 +449,59 @@ def save_config():
         return jsonify({'status': 'success', 'config': config_data})
     return jsonify({'status': 'error', 'message': 'Failed to save configuration.'}), 500
 
+LOCAL_ADDRESSES = ('127.0.0.1', '::1', '::ffff:127.0.0.1')
+
+def local_request_only():
+    """Folder browsing shows this computer's folders, so it is only served to a browser on this computer."""
+    if request.remote_addr in LOCAL_ADDRESSES:
+        return None
+    return jsonify({'status': 'error', 'message': 'Folders can only be browsed from the computer the panel runs on.'}), 403
+
+@app.route('/api/events')
+def api_events():
+    """The persistent event (error) log, newest last. ?limit=100&level=WARNING (WARNING or ERROR hides INFO)."""
+    level = request.args.get('level', '').upper() or None
+    try:
+        limit = min(1000, max(1, int(request.args.get('limit', 100))))
+    except ValueError:
+        limit = 100
+    events = event_log.read_recent(EVENTS_PATH, limit, level if level in event_log.LEVELS else None)
+    return jsonify({'status': 'success', 'events': events})
+
+@app.route('/api/events/download')
+def api_events_download():
+    try:
+        with open(EVENTS_PATH, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+    except OSError:
+        text = ''
+    return Response(text, mimetype='text/plain', headers={'Content-Disposition': 'attachment; filename=events.log'})
+
+@app.route('/api/browse', methods=['GET'])
+def api_browse():
+    """Sub-folders of a folder (relative paths are taken from the folder holding config.json)."""
+    refused = local_request_only()
+    if refused:
+        return refused
+    try:
+        result = folder_browser.browse(request.args.get('path', '').strip(), DATA_DIR)
+    except folder_browser.BrowseError as err:
+        return jsonify({'status': 'error', 'message': str(err)}), 400
+    return jsonify(dict(result, status='success'))
+
+@app.route('/api/browse/mkdir', methods=['POST'])
+def api_browse_mkdir():
+    """Creates a new folder inside the folder being browsed."""
+    refused = local_request_only()
+    if refused:
+        return refused
+    body = request.get_json(silent=True) or {}
+    try:
+        path = folder_browser.make_folder(body.get('parent', ''), body.get('name', ''), DATA_DIR)
+    except folder_browser.BrowseError as err:
+        return jsonify({'status': 'error', 'message': str(err)}), 400
+    return jsonify({'status': 'success', 'path': path})
+
 @app.route('/api/status', methods=['GET'])
 def get_status():
     pid, mode = get_running_process()
@@ -659,6 +718,7 @@ def launch_reader(run_mode, tolerate_db_down=False, fresh=True):
     socketio.emit('link_update', {'state': 'connecting', 'detail': ''})
     if fresh:
         run_summary.start(run_mode)  # a new run replaces the previous run's summary
+        panel_event('RUN_START', f"Reading started in {run_mode.upper()} mode (reader PID {proc.pid}).", mode=run_mode, run_id=current_run_id)
     else:
         run_summary.resume()
     socketio.emit('run_update', run_summary.snapshot())
@@ -683,6 +743,53 @@ def handle_start(data=None):
         except Exception as e:
             socketio.emit('log_update', {'log': f'[SYSTEM] Failed to spawn Janome JP4 process: {e}'})
 
+def panel_event(code, message, level='INFO', **details):
+    """Writes an event to the persistent event log and shows it in the panel log."""
+    line = event_log.emit(code, message, level=level, **details)
+    try:
+        socketio.emit('log_update', {'log': '[EVENT] ' + line})
+        socketio.emit('event_update', {'line': line})
+    except Exception:
+        pass
+
+def read_heartbeat():
+    try:
+        with open(HEARTBEAT_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def write_heartbeat(clean=False):
+    """Marks that the panel is alive. A file without clean=true at the next start means it was killed or lost power."""
+    try:
+        with open(HEARTBEAT_PATH, 'w', encoding='utf-8') as f:
+            json.dump({'time': datetime.now(timezone.utc).isoformat(), 'pid': os.getpid(), 'clean': clean}, f)
+    except Exception as e:
+        print(f"[ERROR] Writing heartbeat: {e}")
+
+def note_service_start():
+    """Fail case 4: tells in the event log how the panel came up (boot, crash recovery, plain start)."""
+    previous = read_heartbeat()
+    was_running = bool(read_desired_state().get('is_running'))
+    up = event_log.uptime_seconds()
+    if previous and not previous.get('clean'):
+        try:
+            last = datetime.fromisoformat(previous['time'])
+            ago = event_log.describe_duration((datetime.now(timezone.utc) - last).total_seconds())
+            seen = f"last sign of life {last.astimezone().strftime('%Y-%m-%d %H:%M:%S')} ({ago} ago)"
+        except Exception:
+            seen = 'time of the last sign of life unknown'
+        panel_event('UNCLEAN_SHUTDOWN',
+                    f"The previous session did not shut down cleanly (crash, killed, power cut or reboot); {seen}."
+                    + (" A run was active, so it is resumed below." if was_running else ""),
+                    level='WARNING' if was_running else 'INFO', run_was_active='yes' if was_running else 'no')
+    booted = f"; the computer started {event_log.describe_duration(up)} ago" if up is not None and up < 900 else ''
+    panel_event('SERVICE_START', f"Panel service started (port {os.environ.get('JANOME_PORT', '8085')}){booted}.",
+                pid=os.getpid())
+    write_heartbeat()
+
+atexit.register(lambda: write_heartbeat(clean=True))
+
 def supervise_reader():
     """
     Restarts the reader if it disappears while the operator wants it running (crash, killed,
@@ -693,6 +800,7 @@ def supervise_reader():
     while True:
         eventlet.sleep(SUPERVISE_EVERY_S)
         try:
+            write_heartbeat()
             desired = read_desired_state()
             if not desired.get('is_running'):
                 continue
@@ -707,6 +815,10 @@ def supervise_reader():
                     socketio.emit('log_update', {'log': '[SYSTEM] The reader could not start because the database is unreachable. Not retrying automatically: fix the database setting, then press Start.'})
                     continue
                 socketio.emit('log_update', {'log': f'[SYSTEM] Reader process is not running (exit code {code}); restarting it automatically.'})
+                if code is not None and code > 0x7FFFFFFF:
+                    code -= 1 << 32  # Windows reports a killed process as 4294967295 (-1)
+                panel_event('READER_RESTARTED', f"The reader process is not running (exit code {code}: crash or killed); "
+                            f"restarting it automatically, same run, no operator needed.", level='ERROR', exit_code=code)
                 launch_reader(mode, tolerate_db_down=True, fresh=False)
         except Exception as e:
             print(f"[ERROR] Reader supervisor: {e}")
@@ -749,10 +861,12 @@ def handle_stop():
     socketio.emit('status_change', {'is_running': False})
     socketio.emit('link_update', {'state': 'idle', 'detail': ''})
     socketio.emit('log_update', {'log': '[SYSTEM] Janome JP4 Ingestion process terminated.'})
+    panel_event('RUN_STOP', 'Reading stopped by the operator (not a failure; it will not restart by itself).', pid=pid)
 
 # Initial recovery check on Web GUI startup
 open_store()
 restore_last_run()
+note_service_start()
 pid, mode = get_running_process()
 if pid is not None:
     print(f"[SYSTEM] Detected active Janome JP4 process running (PID: {pid}). Re-attaching...")
@@ -767,11 +881,16 @@ else:
     if auto_start_enabled or is_desired_running:
         target_mode = startup_cfg.get('auto_start_mode') or desired_state.get('mode', 'mockup')
         print(f"[SYSTEM] Startup config auto_start_on_startup is enabled. Auto-starting Janome JP4 ingestion in MODE={target_mode.upper()}...")
+        reason = ("a run was active when the panel went down" if is_desired_running
+                  else "\"Start reading automatically\" is ticked")
+        panel_event('RUN_RESUMED', f"Reading resumes by itself in {target_mode.upper()} mode, no manual Start needed ({reason}).",
+                    mode=target_mode)
         try:
             # Nobody is watching after a power-up, so do not give up if the database is not reachable yet
             launch_reader(target_mode, tolerate_db_down=True)
         except Exception as e:
             print(f"[ERROR] Auto-start failed: {e}")
+            panel_event('READER_RESTARTED', f"Automatic start of the reader failed: {e}", level='ERROR')
     else:
         print("[SYSTEM] Startup config auto_start_on_startup is disabled. Awaiting manual start trigger.")
 
