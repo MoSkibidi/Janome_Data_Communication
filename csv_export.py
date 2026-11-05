@@ -55,10 +55,19 @@ def parse_day_start(text):
     return hour, minute
 
 
+def clean_folder(text):
+    """
+    A folder typed or pasted by a person: spaces and the quotes Windows adds with 'Copy as path' are removed,
+    ~ and %VARIABLES% are expanded, so a path pasted with or without quotes works the same.
+    """
+    text = str(text or "").strip().strip('"').strip("'").strip()
+    return os.path.expandvars(os.path.expanduser(text)) if text else ""
+
+
 def resolve_folder(csv_cfg, config_path):
     """Where the CSV files go: config 'csv_export.folder' (relative to config.json) or ./exports."""
     base = os.path.dirname(os.path.abspath(config_path))
-    folder = (csv_cfg or {}).get("folder") or DEFAULT_FOLDER
+    folder = clean_folder((csv_cfg or {}).get("folder")) or DEFAULT_FOLDER
     return folder if os.path.isabs(folder) else os.path.join(base, folder)
 
 

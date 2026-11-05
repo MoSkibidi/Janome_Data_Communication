@@ -275,8 +275,26 @@ input:focus-visible, select:focus-visible, summary:focus-visible {
 .data-table.events-table th, .data-table.events-table td { font-family: var(--font); text-align: left; vertical-align: top; }
 .data-table.events-table td:nth-child(4), .data-table.events-table th:nth-child(4) { white-space: normal; min-width: 16rem; }
 .data-table.events-table td:nth-child(3) { font-family: var(--mono); font-size: 0.8125rem; }
+.data-table.events-table td:nth-child(2) { font-weight: 700; white-space: nowrap; }
+/* colour by case: red = something broke, amber = needs a look, green = started / recovered */
 .data-table.events-table tr.event-error td { background: var(--danger-bg); color: var(--danger); }
 .data-table.events-table tr.event-warning td { background: var(--warn-bg); color: var(--warn); }
+.data-table.events-table tr.case-comm-error td,
+.data-table.events-table tr.case-db-error td,
+.data-table.events-table tr.case-db-full td { background: var(--danger-bg); color: var(--danger); }
+.data-table.events-table tr.case-ng td,
+.data-table.events-table tr.case-ng-stop td,
+.data-table.events-table tr.case-data-check td { background: var(--warn-bg); color: var(--warn); }
+.data-table.events-table tr.case-idle td { background: #eef1f6; color: #4a5565; font-style: italic; }
+.data-table.events-table tr.case-start td,
+.data-table.events-table tr.case-working td,
+.data-table.events-table tr.case-recovered td { background: var(--ok-bg); color: var(--ok); }
+.data-table.events-table tr.case-stop td,
+.data-table.events-table tr.case-shutdown td,
+.data-table.events-table tr.case-info td { background: transparent; color: var(--text); }
+/* a crash must stand out from everything else */
+.data-table.events-table tr.case-crash td { background: var(--danger); color: #fff; font-weight: 700; }
+.data-table.events-table tr.case-crash td:first-child { box-shadow: inset 4px 0 0 #000; }
 .badge-finished { background: var(--surface-alt); border-color: var(--border-strong); color: var(--text); }
 
 .run-meta { font-size: 0.9375rem; color: var(--muted); margin-bottom: 12px; }

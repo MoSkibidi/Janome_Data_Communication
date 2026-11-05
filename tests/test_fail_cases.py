@@ -147,6 +147,9 @@ class FakeInflux:
         self.write_headers = []
         self.retention_patches = []
         self.reject_marker = None  # a body containing this text gets HTTP 422
+        self.token = "secret"      # the token the server accepts (change it to simulate a revoked token)
+        self.bucket_missing = False  # the bucket was deleted: writes get HTTP 404
+        self.blackhole = False     # the server accepts the connection and never answers (network cable pulled mid-way)
         self.bucket_days = None
         outer = self
 
@@ -183,8 +186,14 @@ class FakeInflux:
                     if outer.full:
                         return self._send(500, b'{"message":"write failed: no space left on device"}')
                     return self._send(503, b'{"message":"unavailable"}')
-                if self.headers.get("Authorization") != "Token secret":
+                if outer.blackhole:
+                    end = time.monotonic() + 15
+                    while outer.blackhole and time.monotonic() < end:
+                        time.sleep(0.05)
+                if self.headers.get("Authorization") != f"Token {outer.token}":
                     return self._send(401, b'{"message":"unauthorized"}')
+                if outer.bucket_missing:
+                    return self._send(404, b'{"code":"not found","message":"bucket \\"jp4\\" not found"}')
                 if not self.path.startswith("/api/v2/write"):
                     return self._send(404)
                 if outer.reject_marker and outer.reject_marker.encode() in body:
@@ -444,6 +453,169 @@ class DatabaseFailCases(unittest.TestCase):
         self.assertGreater(conn.execute("SELECT COUNT(*) FROM janome_jp4_telemetry").fetchone()[0], 0)
 
 
+class DatabaseProofCases(unittest.TestCase):
+    """
+    Proof for the database fail cases: every outage leaves the right line in events.log AND no reading is lost
+    or sent twice (what the reader kept in its local file is exactly what InfluxDB holds afterwards).
+    """
+
+    def setUp(self):
+        self.influx = FakeInflux()
+        self.addCleanup(self.influx.stop)
+
+    def cfg(self, **extra):
+        cfg = {"db_type": "influxdb", "influx_url": self.influx.url, "influx_token": "secret", "influx_org": "org",
+               "influx_bucket": "jp4", "retry_interval": 0.2}
+        cfg.update(extra)
+        return cfg
+
+    def events(self, run):
+        import event_log
+        return event_log.read_recent(os.path.join(run.tmp, "logs", "events.log"), 1000)
+
+    def codes(self, run):
+        return [e["code"] for e in self.events(run)]
+
+    def local_counts(self, run):
+        conn = sqlite3.connect(os.path.join(run.tmp, "janome_jp4_local.db"))
+        try:
+            return (conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+                    conn.execute("SELECT COUNT(*) FROM cycles").fetchone()[0])
+        finally:
+            conn.close()
+
+    def influx_counts(self):
+        lines = self.influx.lines()
+        cycles = [ln for ln in lines if ln.startswith("janome_jp4_telemetry_cycles")]
+        samples = [ln for ln in lines if not ln.startswith("janome_jp4_telemetry_cycles")]
+        return samples, cycles
+
+    @staticmethod
+    def identity(line):
+        """What InfluxDB uses to tell points apart: measurement + tags, and the timestamp."""
+        return line.split(" ", 1)[0], line.rsplit(" ", 1)[1]
+
+    def assert_nothing_lost_or_doubled(self, run, resend_ok=False):
+        """
+        Everything the reader kept in its local file is in InfluxDB exactly once. With resend_ok a point may
+        arrive twice (the answer to a write was lost, so it was sent again): InfluxDB overwrites a point with the
+        same measurement, tags and timestamp, so it still holds it once.
+        """
+        run.finish()
+        samples, cycles = self.influx_counts()
+        local_samples, local_cycles = self.local_counts(run)
+        sample_ids = [self.identity(ln) for ln in samples]
+        cycle_ids = [self.identity(ln) for ln in cycles]
+        self.assertEqual(len(set(sample_ids)), local_samples, "every reading kept locally must be in InfluxDB")
+        self.assertEqual(len(set(cycle_ids)), local_cycles, "every finished cycle kept locally must be in InfluxDB")
+        if not resend_ok:
+            self.assertEqual(len(sample_ids), len(set(sample_ids)), "no reading may be sent twice")
+            self.assertEqual(len(cycle_ids), len(set(cycle_ids)), "no cycle may be sent twice")
+
+    def test_outage_loses_nothing_and_sends_nothing_twice(self):
+        run = LoopRunner(self, {"database": self.cfg()}).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        counter = [10]
+
+        def stroke():
+            counter[0] += 1
+            run.world.push_cycle(ok_total=counter[0], fault_total=0)
+
+        for _ in range(3):
+            stroke()
+        wait_for(lambda: len(self.influx_counts()[1]) >= 3, what="3 cycles written before the outage")
+        self.influx.down = True
+        wait_for(lambda: "DB_UNREACHABLE" in self.codes(run), what="outage noticed")
+        for _ in range(5):
+            stroke()
+            time.sleep(0.15)
+        wait_for(lambda: run.count("[CYCLE]") >= 8)
+        self.assertEqual(len(self.influx_counts()[1]), 3, "nothing reaches InfluxDB while it is down")
+        self.influx.down = False
+        wait_for(lambda: len(self.influx_counts()[1]) >= 8, what="the 5 offline cycles synced")
+        wait_for(lambda: "DB_RESTORED" in self.codes(run), what="DB_RESTORED event")
+        self.assert_nothing_lost_or_doubled(run)
+        codes = self.codes(run)
+        self.assertEqual(codes.count("DB_UNREACHABLE"), 1)
+        self.assertEqual(codes.count("DB_RESTORED"), 1)
+        self.assertLess(codes.index("DB_UNREACHABLE"), codes.index("DB_RESTORED"))
+        self.assertNotIn("CYCLE_GAP", codes, "the cycles were read, only the database was away")
+
+    def test_revoked_token_is_reported_as_a_setting_problem_not_a_network_problem(self):
+        run = LoopRunner(self, {"database": self.cfg()}).start()
+        wait_for(lambda: len(self.influx.lines()) >= 2)
+        self.influx.token = "somebody-changed-it"
+        wait_for(lambda: "DB_AUTH" in self.codes(run), what="DB_AUTH event")
+        (event,) = [e for e in self.events(run) if e["code"] == "DB_AUTH"]
+        self.assertEqual((event["case"], event["level"]), ("DB ERROR", "ERROR"))
+        self.assertIn("token", event["message"])
+        self.assertNotIn("DB_UNREACHABLE", self.codes(run))
+        self.influx.token = "secret"
+        wait_for(lambda: "DB_RESTORED" in self.codes(run), what="DB_RESTORED after the token works again")
+        self.assert_nothing_lost_or_doubled(run)
+
+    def test_deleted_bucket_is_reported_as_missing_bucket(self):
+        run = LoopRunner(self, {"database": self.cfg()}).start()
+        wait_for(lambda: len(self.influx.lines()) >= 2)
+        self.influx.bucket_missing = True
+        wait_for(lambda: "DB_BUCKET" in self.codes(run), what="DB_BUCKET event")
+        self.assertNotIn("DB_UNREACHABLE", self.codes(run))
+        self.influx.bucket_missing = False
+        wait_for(lambda: "DB_RESTORED" in self.codes(run))
+        self.assert_nothing_lost_or_doubled(run)
+
+    def test_network_that_hangs_never_stops_the_readings(self):
+        """A pulled cable usually does not refuse the connection, it just never answers."""
+        run = LoopRunner(self, {"database": self.cfg()}).start()
+        wait_for(lambda: len(self.influx.lines()) >= 2)
+        self.influx.blackhole = True
+        before = run.count("[STATS]")
+        time.sleep(1.5)   # the writer is stuck waiting for the server for up to 5 s
+        self.assertGreaterEqual(run.count("[STATS]") - before, 10, "readings continue while the database hangs")
+        wait_for(lambda: "DB_UNREACHABLE" in self.codes(run), timeout=15, what="timeout turned into DB_UNREACHABLE")
+        self.influx.blackhole = False
+        wait_for(lambda: "DB_RESTORED" in self.codes(run), timeout=15)
+        self.assert_nothing_lost_or_doubled(run, resend_ok=True)
+
+    def test_buffer_limit_reached_is_reported_as_data_dropped_and_local_file_keeps_everything(self):
+        self.influx.down = True
+        run = LoopRunner(self, {"database": self.cfg(max_spool_rows=5, max_buffer=5)}, tolerate_db_down=True).start()
+        wait_for(lambda: "DATA_DROPPED" in self.codes(run), what="DATA_DROPPED event")
+        (event,) = [e for e in self.events(run) if e["code"] == "DATA_DROPPED"]
+        self.assertEqual(event["case"], "DB ERROR")
+        self.assertIn("remain in the local file", event["message"])
+        run.finish()
+        local_samples, _ = self.local_counts(run)
+        spool_left = sqlite3.connect(os.path.join(run.tmp, "janome_jp4_spool.db")).execute("SELECT COUNT(*) FROM spool").fetchone()[0]
+        self.assertLessEqual(spool_left, 5, "the edge spool is bounded")
+        self.assertGreater(local_samples, spool_left, "the local file still has what the spool had to drop")
+
+    def test_a_record_the_server_refuses_is_reported_and_the_rest_are_written(self):
+        import event_log
+        path = os.path.join(tempfile.mkdtemp(), "logs", "events.log")
+        event_log.configure(path)
+        self.addCleanup(event_log.configure, None)
+        handler = DatabaseHandler(self.cfg())
+        ts = datetime.now(timezone.utc)
+        good = {"encoder_position_mm": 1.0, "teaching_position_mm": 1.0, "load_n": 1.0}
+        self.influx.reject_marker = "reject-me"
+        handler.insert_many([(ts, good), (ts, {"_kind": "cycle", "ok": True, "result_text": "reject-me"}), (ts, good)])
+        self.assertEqual(len(self.influx.lines()), 2)
+        (event,) = [e for e in event_log.read_recent(path) if e["code"] == "DB_REJECTED"]
+        self.assertEqual((event["case"], event["level"]), ("DB ERROR", "ERROR"))
+        self.assertIn("HTTP 422", event["message"])
+
+    def test_restart_while_the_database_is_down_keeps_the_data_and_logs_it(self):
+        self.influx.down = True
+        run = LoopRunner(self, {"database": self.cfg()}, tolerate_db_down=True).start()
+        wait_for(lambda: "DB_UNREACHABLE" in self.codes(run))
+        wait_for(lambda: run.count("[STATS]") >= 5)
+        run.finish()
+        left = [e for e in self.events(run) if e["code"] == "DB_UNREACHABLE" and "kept in" in e["message"]]
+        self.assertTrue(left, "the log says how many readings wait on disk for the next start")
+
+
 class LocalFileCases(unittest.TestCase):
     """The local SQLite file keeps everything that was read, with or without a database server."""
 
@@ -519,6 +691,25 @@ class LocalFileCases(unittest.TestCase):
         self.assertEqual(store.count_samples(), 1000)
         first = next(store.run_samples(run_id))
         self.assertEqual(first[1], 300.0)
+
+
+class PastedFolderCases(unittest.TestCase):
+    """A folder pasted into the panel (Windows 'Copy as path' adds quotes) is used as it is."""
+
+    def test_full_path_with_or_without_quotes_is_used_as_typed(self):
+        import csv_export
+        base = os.path.join(tempfile.mkdtemp(), "config.json")
+        for typed in (r"C:\Intel", r'"C:\Intel"', r"  C:\Intel  ", r"'C:\Intel'", r'"C:\Intel\"'):
+            folder = csv_export.resolve_folder({"folder": typed}, base)
+            self.assertEqual(folder.rstrip("\\/").lower().replace("/", "\\"), r"c:\intel", typed)
+        self.assertEqual(csv_export.resolve_folder({"folder": "exports"}, base), os.path.join(os.path.dirname(base), "exports"))
+        self.assertEqual(csv_export.resolve_folder({"folder": ""}, base), os.path.join(os.path.dirname(base), csv_export.DEFAULT_FOLDER))
+
+    def test_a_folder_that_does_not_exist_yet_is_created(self):
+        import csv_export
+        target = os.path.join(tempfile.mkdtemp(), "new", "deep")
+        csv_export.CsvExporter(target, "day")
+        self.assertTrue(os.path.isdir(target))
 
 
 class CsvFileCases(unittest.TestCase):
@@ -919,6 +1110,14 @@ class EventLogCases(unittest.TestCase):
         self.assertIn("no space left", full["message"])
         self.assertNotIn("DB_UNREACHABLE", self.codes(run))
 
+    def test_classify_db_error_tells_a_wrong_setting_from_a_network_problem(self):
+        from database_handler import classify_db_error
+        self.assertEqual(classify_db_error(Exception("InfluxDB HTTP 401: unauthorized")), "DB_AUTH")
+        self.assertEqual(classify_db_error(Exception("InfluxDB rejected the credentials (HTTP 403): x")), "DB_AUTH")
+        self.assertEqual(classify_db_error(Exception("InfluxDB HTTP 404: bucket not found")), "DB_BUCKET")
+        self.assertEqual(classify_db_error(Exception("InfluxDB bucket 'jp4' (org 'o') was not found: x")), "DB_BUCKET")
+        self.assertEqual(classify_db_error(Exception("cannot reach InfluxDB at http://x: [WinError 10061] refused")), "DB_UNREACHABLE")
+
     def test_classify_db_error(self):
         from database_handler import classify_db_error
         self.assertEqual(classify_db_error(Exception("InfluxDB HTTP 507: Insufficient Storage")), "DB_FULL")
@@ -941,9 +1140,10 @@ class EventLogCases(unittest.TestCase):
         path = os.path.join(tempfile.mkdtemp(), "logs", "events.log")
         line = event_log.emit("RS232_LOST", "port gone | really\nnow", level="ERROR", path=path, port="COM7", empty=None)
         event_log.emit("SERVICE_START", "panel up", path=path)
-        self.assertRegex(line, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \| ERROR   \| RS232_LOST\s+\| port gone / really now \| port=COM7$")
+        self.assertRegex(line, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \| ERROR   \| COMM ERROR \| RS232_LOST\s+\| port gone / really now \| port=COM7$")
         events = event_log.read_recent(path, 10)
         self.assertEqual([e["code"] for e in events], ["RS232_LOST", "SERVICE_START"])
+        self.assertEqual([e["case"] for e in events], ["COMM ERROR", "START"])
         self.assertEqual(events[0]["details"], "port=COM7")
         self.assertEqual([e["code"] for e in event_log.read_recent(path, 10, "WARNING")], ["RS232_LOST"])
         self.assertEqual(len(event_log.read_recent(path, 1)), 1)
@@ -956,6 +1156,90 @@ class EventLogCases(unittest.TestCase):
         self.assertTrue(os.path.exists(path + ".1"), "a full file is rotated, never truncated")
         self.assertEqual([e["code"] for e in event_log.read_recent(path, 10)], ["SERVICE_START"])
         self.assertEqual(event_log.read_recent(os.path.join(tempfile.mkdtemp(), "none.log")), [])
+
+    def test_every_event_code_has_a_plain_case_label(self):
+        import event_log
+        expected = {
+            "SERVICE_START": "START", "READER_START": "START", "RUN_RESUMED": "START",
+            "RUN_STOP": "STOP", "READER_STOP": "STOP", "SERVICE_STOP": "SHUTDOWN",
+            "RS232_LOST": "COMM ERROR", "PRESS_NO_RESPONSE": "COMM ERROR",
+            "RS232_RECOVERED": "RECOVERED", "PRESS_RECOVERED": "RECOVERED", "DB_RESTORED": "RECOVERED",
+            "PRESS_NG": "NG", "UNCLEAN_SHUTDOWN": "CRASH", "READER_RESTARTED": "CRASH", "READER_ERROR": "CRASH",
+            "DB_UNREACHABLE": "DB ERROR", "DB_FULL": "DB FULL",
+            "CYCLE_GAP": "DATA CHECK", "CYCLE_COUNTER_RESET": "DATA CHECK",
+        }
+        for code, case in expected.items():
+            self.assertEqual(event_log.case_of(code), case, code)
+        self.assertEqual(event_log.case_of("SOMETHING_NEW"), "INFO", "an unknown code is still shown, as INFO")
+
+    def test_press_on_but_idle_for_10_s_is_logged_once_and_again_when_it_works(self):
+        import read_janome_jp4 as reader
+        import event_log
+        now = [100.0]
+        path = os.path.join(tempfile.mkdtemp(), "logs", "events.log")
+        event_log.configure(path)
+        self.addCleanup(event_log.configure, None)
+        watch = reader.IdleWatch(10, label="COM7", clock=lambda: now[0])
+        watch.check(True)                       # link just came up: the quiet period starts
+        now[0] += 9.5
+        watch.check(True)
+        self.assertEqual(event_log.read_recent(path), [], "not yet 10 s")
+        now[0] += 1.0
+        watch.check(True)
+        now[0] += 30
+        watch.check(True)                       # still idle: no second line
+        (idle,) = event_log.read_recent(path)
+        self.assertEqual((idle["code"], idle["case"], idle["level"]), ("PRESS_IDLE", "IDLE", "INFO"))
+        self.assertIn("no stroke for 10 s", idle["message"])
+        watch.cycles_seen(1)
+        working = event_log.read_recent(path)[-1]
+        self.assertEqual((working["code"], working["case"]), ("PRESS_WORKING", "WORKING"))
+        self.assertIn("idle for 40 s", working["message"])
+        # a stroke every few seconds is never idle; a link problem is not idle either
+        for _ in range(5):
+            now[0] += 8
+            watch.cycles_seen(1)
+            watch.check(True)
+        watch.check(False)
+        now[0] += 60
+        watch.check(False)
+        self.assertEqual([e["code"] for e in event_log.read_recent(path)], ["PRESS_IDLE", "PRESS_WORKING"])
+        disabled = reader.IdleWatch(0, clock=lambda: now[0])
+        disabled.check(True)
+        now[0] += 999
+        disabled.check(True)
+        self.assertEqual(len(event_log.read_recent(path)), 2)
+
+    def test_the_running_reader_logs_idle_when_no_stroke_comes(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}, "event_log": {"idle_alert_s": 1}}).start()
+        wait_for(lambda: "PRESS_IDLE" in self.codes(run), what="PRESS_IDLE event")
+        run.world.push_cycle(result_code=0)
+        wait_for(lambda: "PRESS_WORKING" in self.codes(run), what="PRESS_WORKING event")
+        run.finish()
+        self.assertEqual(self.codes(run).count("PRESS_IDLE"), 1)
+
+    def test_a_case_can_be_overridden_and_old_lines_still_read(self):
+        import event_log
+        path = os.path.join(tempfile.mkdtemp(), "logs", "events.log")
+        line = event_log.emit("PRESS_NG", "stopped", level="WARNING", path=path, case="NG STOP")
+        self.assertIn("| NG STOP    | PRESS_NG", line)
+        with open(path, "a", encoding="utf-8") as f:   # a line from before the case column existed
+            f.write("2026-11-01 08:00:00 | ERROR   | UNCLEAN_SHUTDOWN  | old line | run=1\n")
+        events = event_log.read_recent(path, 10)
+        self.assertEqual([e["case"] for e in events], ["NG STOP", "CRASH"])
+        self.assertEqual(events[1]["message"], "old line")
+        self.assertEqual(events[1]["details"], "run=1")
+
+    def test_a_crash_reader_exit_is_labelled_crash_and_a_normal_stop_is_not(self):
+        run = LoopRunner(self, {"database": {"db_type": "none"}}).start()
+        wait_for(lambda: "[LINK] state=up" in run.text())
+        time.sleep(0.2)
+        run.world.push_cycle(result_code=3232)
+        wait_for(lambda: run.count("[CYCLE]") >= 1)
+        run.finish()
+        by_code = {e["code"]: e for e in self.events(run)}
+        self.assertEqual(by_code["READER_START"]["case"], "START")
+        self.assertEqual(by_code["PRESS_NG"]["case"], "NG STOP", "result 3232 = stopped before finishing")
 
     def test_a_log_file_that_cannot_be_written_never_stops_the_collection(self):
         import event_log

@@ -149,22 +149,49 @@ the normal Log. Unlike the pipeline log, which starts empty on every Start, this
 appended to (rotated at 5 MB into `events.log.1` ...), so the history survives Stop/Start, a crash and a
 reboot. One line per event, one line per outage (not one per retry):
 
+Each line starts with a plain **case** (what kind of thing happened) and then the exact event code. The panel
+shows the case as the second column and colours the row: **CRASH** is white-on-red and bold, `COMM ERROR`,
+`DB ERROR` and `DB FULL` are red, `NG` / `NG STOP` / `DATA CHECK` amber, `START` / `RECOVERED` green,
+`STOP` / `SHUTDOWN` / `INFO` plain.
+
 ```
-2026-11-05 11:20:46 | ERROR   | RS232_LOST        | RS-232 port COM7 is not available (adapter unplugged or port busy). Auto-reconnect: opening it again every 5 s. | port=COM7 reason=...
-2026-11-05 11:21:30 | INFO    | RS232_RECOVERED   | RS-232 port COM7 is back and the press answers; reading continues automatically (link was down 44 s). | port=COM7 down_for=44 s
+time                | level   | case       | code              | message                                                | details
+2026-11-05 11:20:46 | ERROR   | COMM ERROR | RS232_LOST        | RS-232 port COM7 is not available (adapter unplugged or port busy). Auto-reconnect: opening it again every 5 s. | port=COM7 reason=...
+2026-11-05 11:21:30 | INFO    | RECOVERED  | RS232_RECOVERED   | RS-232 port COM7 is back and the press answers; reading continues automatically (link was down 44 s). | port=COM7 down_for=44 s
 ```
 
-| # | Event code (level) | When |
+| Case | Event codes | When |
 |---|---|---|
-| 1 | `RS232_LOST` (ERROR), `RS232_RECOVERED` | USB/RS-232 adapter unplugged, port busy or missing; the port opens again by itself |
-| 1, 3 | `PRESS_NO_RESPONSE` (ERROR), `PRESS_RECOVERED` | Port is open but the press is silent: powered off, RS-232 cable pulled at the press, wrong baud rate. Recovery = press back on / cable back, with how long it was down |
-| 2 | `PRESS_NG` (WARNING) | A cycle finished NG: result code and text, program, end position and load, fault counter. Result codes 3229 / 3232 / 3233 are marked as "stopped before it finished (emergency stop / stop signal)" |
-| 4 | `SERVICE_START`, `UNCLEAN_SHUTDOWN` (WARNING when a run was active), `RUN_RESUMED`, `READER_START` | The panel came up. `UNCLEAN_SHUTDOWN` = the previous session was killed or lost power (with the time of its last sign of life); `RUN_RESUMED` = reading restarted by itself; `READER_START` says automatic or manual |
-| 4b | `READER_RESTARTED` (ERROR), `READER_ERROR` | The reader process died and the panel started it again (same run) |
-| 5 | `DB_FULL` (ERROR), `DB_REJECTED`, `DB_RETENTION` | InfluxDB out of space ("no space left", HTTP 507), a record refused, or the retention period applied/failed |
-| 6 | `DB_UNREACHABLE` (ERROR), `DB_RESTORED`, `DATA_DROPPED` | Network/database down (data kept at the edge) and synced again; `DATA_DROPPED` only if the edge buffer limit was hit |
-| 7 | `CYCLE_GAP` (WARNING), `CYCLE_COUNTER_RESET` | The press cycle counter jumped: cycles happened while nothing was reading (the counter of the last saved cycle is remembered across restarts), or it went backwards |
-| - | `RUN_START`, `RUN_STOP`, `READER_STOP` | Start/Stop by the operator, so a deliberate stop is never mistaken for a failure |
+| `START` | `SERVICE_START`, `READER_START`, `PRESS_CONNECTED`, `RUN_START`, `RUN_RESUMED` | The panel came up (a note says when it was a computer boot), the reader started (automatic or manual), the press connected, or reading resumed by itself after a crash |
+| `STOP` | `RUN_STOP`, `READER_STOP` | The operator pressed Stop (a deliberate stop is never a failure) |
+| `SHUTDOWN` | `SERVICE_STOP` | Normal shutdown of the panel: closing the console, Windows logoff/shutdown, SIGTERM, or `stop.bat` (which leaves a `.janome_jp4_clean_stop` note, so the next start logs "stopped with stop.bat" instead of a crash) |
+| `COMM ERROR` | `RS232_LOST`, `PRESS_NO_RESPONSE` | USB/RS-232 adapter unplugged or port busy; or the port is open but the press is silent (powered off, cable pulled at the press, wrong baud rate). Powering the press off normally looks like this |
+| `RECOVERED` | `RS232_RECOVERED`, `PRESS_RECOVERED`, `DB_RESTORED` | The port or the press answers again, or the database is reachable again, with how long it was down |
+| `IDLE` | `PRESS_IDLE` | The press is on and answering but made no stroke for 60 s (no job running), counted from the link coming up or the last cycle. One line per quiet period, not one every 60 s. Change the time with `"event_log": {"idle_alert_s": 60}` in `config.json`; 0 turns it off. A link problem is never reported as idle |
+| `WORKING` | `PRESS_WORKING` | The first stroke after an idle period, with how long it was idle |
+| `NG` | `PRESS_NG` | A cycle finished NG (WARNING): result code and text, program, end position and load, fault counter |
+| `NG STOP` | `PRESS_NG` | Same, but the result code is 3229 / 3232 / 3233: the stroke was stopped before it finished (emergency stop / stop signal) |
+| `CRASH` | `UNCLEAN_SHUTDOWN`, `READER_RESTARTED`, `READER_ERROR` | The previous panel session was killed or lost power while a run was active (ERROR, with the time of its last sign of life), or the reader process died and the panel restarted it. Reading resumes by itself |
+| `DB ERROR` | `DB_UNREACHABLE`, `DB_AUTH`, `DB_BUCKET`, `DB_REJECTED`, `DATA_DROPPED` | `DB_UNREACHABLE`: network/server down or not answering (data kept at the edge and synced later, oldest first). `DB_AUTH`: the server answers but refuses the token (revoked or changed). `DB_BUCKET`: the bucket/organization does not exist. `DB_REJECTED`: one record refused, the others still go. `DATA_DROPPED`: the edge buffer limit was hit (the local file still has everything) |
+| `DB FULL` | `DB_FULL` | InfluxDB out of space ("no space left", HTTP 507) |
+| `DATA CHECK` | `CYCLE_GAP`, `CYCLE_COUNTER_RESET` | The press cycle counter jumped (cycles happened while nothing was reading; the counter of the last saved cycle is remembered across restarts) or went backwards |
+| `INFO` | `DB_RETENTION`, anything new | The retention period was applied/failed |
+
+If the panel starts and the previous session ended without a `SHUTDOWN` while no run was active, the log
+shows `UNCLEAN_SHUTDOWN` as `STOP` (INFO): nothing was being read, so nothing was lost.
+The Windows shutdown hook has not been tried on a real reboot yet.
+
+#### Proving the database cases
+
+- `python tests/prove_db_fail_cases.py` runs the real reader against a fake press and a fake InfluxDB that it
+  breaks on purpose (server down, disk full, token revoked, bucket deleted, a network that hangs). It prints the
+  lines that appear in `events.log` for each fault and its recovery, then compares what the reader read with what
+  InfluxDB holds (nothing lost, nothing doubled). Exit code 0 = all good.
+- `tests/test_fail_cases.py` (`DatabaseProofCases`) checks the same with assertions.
+- On the real InfluxDB: stop the InfluxDB service (expect `DB ERROR / DB_UNREACHABLE`), start it (expect
+  `RECOVERED / DB_RESTORED` and the missing points filling in with their original times), delete or change the
+  token in InfluxDB (`DB_AUTH`), rename the bucket (`DB_BUCKET`). A full disk is only simulated: it cannot be
+  triggered safely on a real server.
 
 ### Start at boot and after a crash
 

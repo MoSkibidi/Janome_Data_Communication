@@ -21,10 +21,32 @@ _DISK_FULL_HINTS = ("no space", "disk full", "disk is full", "out of space", "no
                     "insufficient storage", "quota", "http 507")
 
 
+# A wrong or revoked token, and a bucket / organization that does not exist: the server is reachable, the setting is wrong
+_AUTH_HINTS = ("http 401", "http 403", "credentials", "unauthorized", "forbidden")
+_MISSING_HINTS = ("http 404", "was not found", "does not exist")
+
+
 def classify_db_error(err):
-    """Event code for a database error: DB_FULL when the server is out of space, else DB_UNREACHABLE."""
+    """
+    Event code for a database error: DB_FULL when the server is out of space, DB_AUTH when it refuses the
+    token, DB_BUCKET when the bucket/database is missing, else DB_UNREACHABLE (network or server down).
+    """
     text = str(err).lower()
-    return "DB_FULL" if any(hint in text for hint in _DISK_FULL_HINTS) else "DB_UNREACHABLE"
+    if any(hint in text for hint in _DISK_FULL_HINTS):
+        return "DB_FULL"
+    if any(hint in text for hint in _AUTH_HINTS):
+        return "DB_AUTH"
+    if any(hint in text for hint in _MISSING_HINTS):
+        return "DB_BUCKET"
+    return "DB_UNREACHABLE"
+
+
+DB_ERROR_TEXT = {
+    "DB_FULL": "The database is full (no space left)",
+    "DB_AUTH": "The database refuses the token/credentials (the server is reachable; correct the token in Settings)",
+    "DB_BUCKET": "The database bucket/organization was not found (the server is reachable; correct the name in Settings)",
+    "DB_UNREACHABLE": "The database/network is unreachable",
+}
 
 # Per-cycle ("quality data") record: one row per press stroke, OK or NG.
 # (column name, kind) - kind decides the SQL type; InfluxDB uses the same names as fields.
@@ -707,8 +729,7 @@ class BufferedDatabaseWriter:
         self._down_since = self._down_since or time.monotonic()
         logger.warning(f"[DB] Database unavailable ({err}); spooling samples to disk until it is back.")
         code = classify_db_error(err)
-        what = ("The database is full (no space left)" if code == "DB_FULL"
-                else "The database/network is unreachable")
+        what = DB_ERROR_TEXT[code]
         event_log.emit(code, f"{what} ({err}). Data is stored at the edge (local file + disk spool) and synced "
                        f"automatically, oldest first, when it is back.", level="ERROR", waiting=self.pending)
 

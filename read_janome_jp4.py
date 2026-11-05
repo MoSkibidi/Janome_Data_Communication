@@ -671,6 +671,45 @@ def describe_db(db_cfg, db_type):
 STOP_RESULT_CODES = (3229, 3232, 3233)  # the cycle was stopped before it finished (stop signal / emergency stop)
 
 
+class IdleWatch:
+    """
+    Tells the event log when the press is on and answering but makes no stroke: PRESS_IDLE once after
+    `after_s` seconds without a finished cycle (counted from the link coming up or the last cycle),
+    PRESS_WORKING when the next cycle arrives. 0 turns it off. A broken link is not idle: it has its own events.
+    """
+
+    def __init__(self, after_s, label="", clock=time.monotonic):
+        self.after_s = after_s
+        self.label = label or None
+        self.clock = clock
+        self.since = None      # start of the current quiet period
+        self.reported = False
+
+    def cycles_seen(self, count):
+        if not count:
+            return
+        if self.reported and self.since is not None:
+            event_log.emit("PRESS_WORKING", f"The press made a stroke again after being idle for "
+                           f"{event_log.describe_duration(self.clock() - self.since)}.", port=self.label)
+        self.since = self.clock()
+        self.reported = False
+
+    def check(self, link_up):
+        if not self.after_s or self.after_s <= 0:
+            return
+        if not link_up:
+            self.since, self.reported = None, False
+            return
+        now = self.clock()
+        if self.since is None:
+            self.since = now
+        elif not self.reported and now - self.since >= self.after_s:
+            self.reported = True
+            event_log.emit("PRESS_IDLE", f"The press is on and answering but no stroke for {event_log.describe_duration(now - self.since)} "
+                           f"(no job running). Nothing is lost; cycles are recorded as soon as it works.",
+                           port=self.label, idle_s=int(now - self.since))
+
+
 def make_cycle_handler(writer, keep_local=None, last_total=None):
     """
     Returns a function that logs finished cycles ([CYCLE] line, NG events), queues them for
@@ -722,7 +761,8 @@ def make_cycle_handler(writer, keep_local=None, last_total=None):
                     f"Press reported NG: result {cycle['result_code']} ({cycle['result_text']})"
                     + (", the stroke was stopped before it finished (emergency stop / stop signal)" if stopped else "")
                     + ". The NG record is saved to the local file, CSV and the database.",
-                    level="WARNING", program=cycle.get("program_number"), result_code=cycle["result_code"],
+                    level="WARNING", case="NG STOP" if stopped else None,
+                    program=cycle.get("program_number"), result_code=cycle["result_code"],
                     end_position_mm=cycle.get("end_position_mm"), end_load_n=cycle.get("end_load_n"),
                     fault_total=cycle.get("fault_total"), backlog=1 if cycle.get("backlog") else None,
                 )
@@ -832,7 +872,7 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                 if spool.count == 0 and not tolerate_db_down:
                     logger.error(f"[DB ERROR] Cannot connect to {where}: {err}")
                     logger.error("[DB ERROR] Ingestion not started. Fix the database settings or set the database to 'This computer only'.")
-                    event_log.emit("DB_UNREACHABLE", f"Cannot connect to {where}: {err}. Reading was not started; fix the "
+                    event_log.emit(classify_db_error(err), f"Cannot connect to {where}: {err}. Reading was not started; fix the "
                                    f"database setting (or use 'This computer only') and press Start.", level="ERROR")
                     spool.close()
                     return 2
@@ -946,7 +986,19 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
                 last_total = local.last_lifetime_total("mock" if mock_mode else "real")
             except Exception as err:
                 logger.warning(f"[LOCAL] Could not read the last cycle counter: {err}")
-        handle_cycles = make_cycle_handler(writer, keep_local, last_total)
+        base_handle_cycles = make_cycle_handler(writer, keep_local, last_total)
+        try:
+            idle_after_s = float((config.get("event_log") or {}).get("idle_alert_s", 60))
+        except (TypeError, ValueError):
+            logger.warning("[EVENT] Bad event_log idle_alert_s; using 60 s.")
+            idle_after_s = 10.0
+        idle_watch = IdleWatch(idle_after_s, label=session.label)
+
+        def handle_cycles(cycles):
+            idle_watch.cycles_seen(len(cycles))
+            base_handle_cycles(cycles)
+            idle_watch.check(session.press is not None and session.state == "up")
+
         event_log.emit("READER_START",
                        f"Reader started ({'automatic start, no operator' if tolerate_db_down else 'manual start'}): "
                        f"{'MOCK simulation' if mock_mode else 'press on ' + str(port) + ' @ ' + str(baudrate) + ' bps'}; "
@@ -1014,7 +1066,7 @@ def run_ingestion_loop(config_path="config.json", max_iterations=None, override_
         event_log.emit("READER_STOP", "Reader stopped (Ctrl+C or stop request).", run_id=run_id)
     except Exception as err:
         logger.error(f"Service encountered an error: {err}")
-        event_log.emit("READER_ERROR", f"The reader stopped because of an error: {err}. The panel restarts it "
+        event_log.emit("READER_ERROR", f"CRASH: the reader stopped because of an error: {err}. The panel restarts it "
                        f"automatically if the run should still be going.", level="ERROR", run_id=run_id)
         return 1
     finally:

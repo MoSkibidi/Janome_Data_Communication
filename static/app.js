@@ -310,7 +310,8 @@ document.addEventListener('DOMContentLoaded', () => {
             payload.csv_export = {
                 enabled: csvEnabledBox.checked,
                 mode: csvModeSelect.value,
-                folder: csvFolderInput.value.trim() || 'exports'
+                // Windows "Copy as path" puts the path in quotes: they are not part of the folder name
+                folder: csvFolderInput.value.trim().replace(/^["']+|["']+$/g, '').trim() || 'exports'
             };
             const csvDayStartInput = document.getElementById('CSV_DAY_START');
             if (csvDayStartInput) payload.csv_export.day_start = csvDayStartInput.value || '00:00';
@@ -677,16 +678,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const MAX_EVENT_ROWS = 200;
 
     function parseEventLine(line) {
+        // time | LEVEL | CASE | CODE | message | details
         const parts = line.split(' | ');
-        if (parts.length < 4) return null;
-        return { time: parts[0].trim(), level: parts[1].trim(), code: parts[2].trim(),
-                 message: parts[3].trim(), details: (parts[4] || '').trim() };
+        if (parts.length < 5) return null;
+        return { time: parts[0].trim(), level: parts[1].trim(), case: parts[2].trim(), code: parts[3].trim(),
+                 message: parts[4].trim(), details: (parts[5] || '').trim() };
     }
 
     function eventRow(ev) {
         const tr = document.createElement('tr');
-        tr.className = `event-${ev.level.toLowerCase()}`;
-        const cells = [ev.time.slice(5), ev.level, ev.code, ev.details ? `${ev.message} (${ev.details})` : ev.message];
+        const slug = (ev.case || 'info').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        tr.className = `event-${ev.level.toLowerCase()} case-${slug}`;
+        const cells = [ev.time.slice(5), ev.case || ev.level, ev.code, ev.details ? `${ev.message} (${ev.details})` : ev.message];
         cells.forEach(text => {
             const td = document.createElement('td');
             td.textContent = text;

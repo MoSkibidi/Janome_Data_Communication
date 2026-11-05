@@ -44,6 +44,7 @@ MODE_PATH = os.path.join(DATA_DIR, '.janome_jp4_process.mode')
 DESIRED_STATE_PATH = os.path.join(DATA_DIR, '.janome_jp4_desired_state.json')
 LOG_PATH = os.path.join(DATA_DIR, 'janome_jp4_pipeline.log')
 HEARTBEAT_PATH = os.path.join(DATA_DIR, '.janome_jp4_heartbeat.json')
+STOP_MARKER_PATH = os.path.join(DATA_DIR, '.janome_jp4_clean_stop')  # written by stop.bat: the stop is deliberate
 
 # Seed an empty data dir with the bundled config (its serial settings differ from the built-in defaults).
 _SEED_CONFIG = os.path.join(BASE_DIR, 'config.json')
@@ -772,6 +773,12 @@ def note_service_start():
     previous = read_heartbeat()
     was_running = bool(read_desired_state().get('is_running'))
     up = event_log.uptime_seconds()
+    stop_requested = os.path.exists(STOP_MARKER_PATH)  # stop.bat leaves this before it kills the panel
+    if stop_requested:
+        try:
+            os.remove(STOP_MARKER_PATH)
+        except OSError:
+            pass
     if previous and not previous.get('clean'):
         try:
             last = datetime.fromisoformat(previous['time'])
@@ -779,16 +786,60 @@ def note_service_start():
             seen = f"last sign of life {last.astimezone().strftime('%Y-%m-%d %H:%M:%S')} ({ago} ago)"
         except Exception:
             seen = 'time of the last sign of life unknown'
-        panel_event('UNCLEAN_SHUTDOWN',
-                    f"The previous session did not shut down cleanly (crash, killed, power cut or reboot); {seen}."
-                    + (" A run was active, so it is resumed below." if was_running else ""),
-                    level='WARNING' if was_running else 'INFO', run_was_active='yes' if was_running else 'no')
+        if stop_requested:
+            panel_event('SERVICE_STOP', f"The panel was stopped with stop.bat; {seen}. (Recorded now, at the next start.)"
+                        + (" A run was active, so it is resumed below." if was_running else ""), case='SHUTDOWN')
+        elif was_running:
+            panel_event('UNCLEAN_SHUTDOWN',
+                        f"CRASH: the previous session ended without a clean shutdown (program crash, killed, power cut "
+                        f"or reboot) while reading was active; {seen}. Reading is resumed below.",
+                        level='ERROR', run_was_active='yes')
+        else:
+            panel_event('UNCLEAN_SHUTDOWN',
+                        f"The previous session ended without a clean shutdown ({seen}); no run was active, so nothing was lost.",
+                        case='STOP', run_was_active='no')
     booted = f"; the computer started {event_log.describe_duration(up)} ago" if up is not None and up < 900 else ''
     panel_event('SERVICE_START', f"Panel service started (port {os.environ.get('JANOME_PORT', '8085')}){booted}.",
                 pid=os.getpid())
     write_heartbeat()
 
-atexit.register(lambda: write_heartbeat(clean=True))
+_stop_noted = [False]
+
+def note_service_stop(reason):
+    """A normal end of the panel (closed, Ctrl+C, computer shutdown/logoff): one SHUTDOWN line, heartbeat marked clean."""
+    if _stop_noted[0]:
+        return
+    _stop_noted[0] = True
+    event_log.emit('SERVICE_STOP', f"Panel stopped normally ({reason}). A run that was active resumes by itself at the next start.",
+                   pid=os.getpid())
+    write_heartbeat(clean=True)
+
+def install_stop_hooks():
+    """Catches the ways a normal shutdown reaches the program, so it is not mistaken for a crash at the next start."""
+    atexit.register(lambda: note_service_stop('program closed'))
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            reasons = {2: 'console window closed', 5: 'user logoff', 6: 'computer shutdown'}
+            handler_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+            def on_console_event(event):
+                if event in reasons:
+                    note_service_stop(reasons[event])
+                return 0  # let Windows end the process as usual
+            install_stop_hooks.keep = handler_type(on_console_event)  # must stay referenced
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(install_stop_hooks.keep, True)
+        else:
+            import signal
+
+            def on_sigterm(signum, frame):
+                note_service_stop('stop signal (SIGTERM)')
+                sys.exit(0)
+            signal.signal(signal.SIGTERM, on_sigterm)
+    except Exception as e:
+        print(f"[WARNING] Could not install the shutdown hook: {e}")
+
+install_stop_hooks()
 
 def supervise_reader():
     """
@@ -817,7 +868,7 @@ def supervise_reader():
                 socketio.emit('log_update', {'log': f'[SYSTEM] Reader process is not running (exit code {code}); restarting it automatically.'})
                 if code is not None and code > 0x7FFFFFFF:
                     code -= 1 << 32  # Windows reports a killed process as 4294967295 (-1)
-                panel_event('READER_RESTARTED', f"The reader process is not running (exit code {code}: crash or killed); "
+                panel_event('READER_RESTARTED', f"CRASH: the reader process died (exit code {code}: crashed or was killed); "
                             f"restarting it automatically, same run, no operator needed.", level='ERROR', exit_code=code)
                 launch_reader(mode, tolerate_db_down=True, fresh=False)
         except Exception as e:

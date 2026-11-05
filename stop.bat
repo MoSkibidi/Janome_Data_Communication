@@ -6,10 +6,15 @@ cd /d "%~dp0"
 
 if "%JANOME_PORT%"=="" set "JANOME_PORT=8085"
 
+rem Leave a note for the panel: this stop is deliberate, so the next start does not log it as a crash
+set "STOP_MARKER_DIR=%JANOME_DATA_DIR%"
+if "%STOP_MARKER_DIR%"=="" set "STOP_MARKER_DIR=%~dp0"
+echo stop>"%STOP_MARKER_DIR%\.janome_jp4_clean_stop"
+
 echo [SYSTEM] Stopping Janome JP4 Control Panel...
 taskkill /fi "WINDOWTITLE eq JANOME_JP4_PANEL*" /t /f >nul 2>&1
 for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr /r /c:":%JANOME_PORT% .*LISTENING"') do (
-    taskkill /f /pid %%a >nul 2>&1
+    taskkill /t /f /pid %%a >nul 2>&1
 )
 
 rem Remove stale runtime state so the next start does not see a dead reader process

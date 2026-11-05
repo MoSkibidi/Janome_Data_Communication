@@ -3,7 +3,10 @@
 # "error log". Every event is one line in logs/events.log next to config.json and is also
 # written to the normal log, so it shows in the panel log as well.
 #
-#   2026-11-05 11:20:46 | ERROR   | RS232_LOST        | RS-232 port COM7 is not available ... | port=COM7
+#   2026-11-05 11:20:46 | ERROR   | COMM ERROR | RS232_LOST        | RS-232 port COM7 is not available ... | port=COM7
+#
+# Each line starts with a plain CASE label that says what kind of thing happened (START, STOP, SHUTDOWN,
+# COMM ERROR, RECOVERED, NG, CRASH, DB ERROR, DB FULL, DATA CHECK), then the exact event CODE.
 #
 # Unlike the pipeline log (which starts empty on every Start) this file is only ever appended to,
 # so the history survives Stop/Start, a crash and a reboot. It is rotated by size (events.log.1 ...).
@@ -12,10 +15,13 @@
 #   1  RS232_LOST, RS232_RECOVERED          USB/RS-232 adapter unplugged or the port cannot be opened
 #      PRESS_NO_RESPONSE, PRESS_RECOVERED   port open but the press is silent (powered off, cable)
 #   2  PRESS_NG                             a cycle finished with a non-zero result (NG / stop)
-#   3  PRESS_RECOVERED                      the press answers again after power OFF/ON; reading resumes
-#   4  SERVICE_START, UNCLEAN_SHUTDOWN, RUN_RESUMED, READER_RESTARTED   crash, reboot, auto-start
+#   -  PRESS_IDLE, PRESS_WORKING            press on and answering but no stroke for 60 s (event_log.idle_alert_s), and back
+#   3  PRESS_RECOVERED                     the press answers again after power OFF/ON; reading resumes
+#   4  SERVICE_START, SERVICE_STOP, UNCLEAN_SHUTDOWN, RUN_RESUMED, READER_RESTARTED   start, normal
+#      shutdown, crash / power loss, auto-resume
 #   5  DB_FULL, DB_REJECTED, DB_RETENTION    InfluxDB out of space / refusing data / retention applied
 #   6  DB_UNREACHABLE, DB_RESTORED, DATA_DROPPED   network or database down, data kept at the edge
+#      DB_AUTH, DB_BUCKET                  server reachable but the token / bucket setting is wrong
 #   7  CYCLE_GAP, CYCLE_COUNTER_RESET       stamping data check: cycles missing between two results
 # English comments only
 
@@ -30,6 +36,22 @@ FILE_NAME = "events.log"
 MAX_BYTES = 5 * 1024 * 1024
 KEEP_FILES = 5
 LEVELS = ("INFO", "WARNING", "ERROR")
+
+# Plain-language case of every event code (shown first in the log and highlighted in the panel)
+CASE_OF = {
+    "SERVICE_START": "START", "RUN_START": "START", "RUN_RESUMED": "START", "READER_START": "START",
+    "PRESS_CONNECTED": "START",
+    "RUN_STOP": "STOP", "READER_STOP": "STOP",
+    "SERVICE_STOP": "SHUTDOWN",
+    "RS232_LOST": "COMM ERROR", "PRESS_NO_RESPONSE": "COMM ERROR",
+    "RS232_RECOVERED": "RECOVERED", "PRESS_RECOVERED": "RECOVERED", "DB_RESTORED": "RECOVERED",
+    "PRESS_NG": "NG",
+    "PRESS_IDLE": "IDLE", "PRESS_WORKING": "WORKING",
+    "UNCLEAN_SHUTDOWN": "CRASH", "READER_RESTARTED": "CRASH", "READER_ERROR": "CRASH",
+    "DB_UNREACHABLE": "DB ERROR", "DB_AUTH": "DB ERROR", "DB_BUCKET": "DB ERROR", "DB_REJECTED": "DB ERROR", "DATA_DROPPED": "DB ERROR", "DB_FULL": "DB FULL",
+    "CYCLE_GAP": "DATA CHECK", "CYCLE_COUNTER_RESET": "DATA CHECK",
+    "DB_RETENTION": "INFO",
+}
 
 _path = None
 _lock = threading.Lock()
@@ -59,10 +81,14 @@ def _clean(value):
     return str(value).replace("|", "/").replace("\r", " ").replace("\n", " ").strip()
 
 
-def format_line(level, code, message, details=None, when=None):
+def case_of(code):
+    return CASE_OF.get(code, "INFO")
+
+
+def format_line(level, code, message, details=None, when=None, case=None):
     when = when or datetime.now().astimezone()
     extra = " ".join(f"{key}={_clean(value)}" for key, value in (details or {}).items() if value is not None)
-    parts = [when.strftime("%Y-%m-%d %H:%M:%S"), f"{level:<7}", f"{code:<17}", _clean(message)]
+    parts = [when.strftime("%Y-%m-%d %H:%M:%S"), f"{level:<7}", f"{case or case_of(code):<10}", f"{code:<17}", _clean(message)]
     if extra:
         parts.append(extra)
     return " | ".join(parts)
@@ -76,15 +102,16 @@ def _rotate(path):
     os.replace(path, f"{path}.1")
 
 
-def emit(code, message, level="INFO", path=None, **details):
+def emit(code, message, level="INFO", path=None, case=None, **details):
     """
     Records one event: a line in events.log and in the normal log. Never raises, so a problem
-    with the log file can never stop the collection. Returns the formatted line.
+    with the log file can never stop the collection. `case` overrides the usual case label of the
+    code. Returns the formatted line.
     """
     level = level.upper() if level.upper() in LEVELS else "INFO"
-    line = format_line(level, code, message, details)
+    line = format_line(level, code, message, details, case=case)
     log = {"INFO": logger.info, "WARNING": logger.warning, "ERROR": logger.error}[level]
-    log(f"[EVENT] {code} {_clean(message)}" + "".join(f" {k}={_clean(v)}" for k, v in details.items() if v is not None))
+    log(f"[EVENT] [{case or case_of(code)}] {code} {_clean(message)}" + "".join(f" {k}={_clean(v)}" for k, v in details.items() if v is not None))
     target = path or _path
     if target:
         try:
@@ -101,7 +128,7 @@ def emit(code, message, level="INFO", path=None, **details):
 
 
 def read_recent(path, limit=100, min_level=None):
-    """The last `limit` events of the file, newest last, as dicts (time, level, code, message, details)."""
+    """The last `limit` events of the file, newest last, as dicts (time, level, case, code, message, details)."""
     if not path or not os.path.exists(path):
         return []
     try:
@@ -111,11 +138,15 @@ def read_recent(path, limit=100, min_level=None):
         return []
     events = []
     for raw in lines[-max(1, int(limit)) * 2:]:
-        parts = [p.strip() for p in raw.rstrip("\r\n").split(" | ", 4)]
+        parts = [p.strip() for p in raw.rstrip("\r\n").split(" | ", 5)]
         if len(parts) < 4:
             continue
-        event = {"time": parts[0], "level": parts[1], "code": parts[2], "message": parts[3],
-                 "details": parts[4] if len(parts) > 4 else ""}
+        if parts[2] in CASE_OF:  # a line written before the case label existed: time | level | code | message | details
+            parts.insert(2, case_of(parts[2]))
+        if len(parts) < 5:
+            continue
+        event = {"time": parts[0], "level": parts[1], "case": parts[2], "code": parts[3], "message": parts[4],
+                 "details": parts[5] if len(parts) > 5 else ""}
         if min_level and LEVELS.index(event["level"] if event["level"] in LEVELS else "INFO") < LEVELS.index(min_level):
             continue
         events.append(event)
